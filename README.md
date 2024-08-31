@@ -1,6 +1,8 @@
 # minformer
 Minimal transformer for arbtirary data (i.e. bio stuff!)
 
+Heavily inspired / stuff lifted from the classic - MinGPT.
+
 
 ## Setup (local):
 Get gcloud CLI https://cloud.google.com/sdk/docs/install-sdk
