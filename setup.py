@@ -8,5 +8,6 @@ setup(name='minformer',
       license='MIT',
       install_requires=[
             'jax',
+            'tqdm',
       ],
 )
