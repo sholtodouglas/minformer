@@ -44,3 +44,6 @@ Host *
 ```
 
 You can then use the remote editor to edit code, and push/pull to sync.
+
+
+pip3 install -r requirements.txt
