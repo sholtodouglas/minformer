@@ -64,6 +64,7 @@ class CharDataset:
         def save_tfrecord(writer, token_span, segment_ids):
             x = token_span[:-1]
             y = token_span[1:]
+            segment_ids = segment_ids[:-1]
             example = tf.train.Example(features=tf.train.Features(feature={
                 'x': tf.train.Feature(int64_list=tf.train.Int64List(value=x)),
                 'y': tf.train.Feature(int64_list=tf.train.Int64List(value=y)),
