@@ -1,6 +1,6 @@
 --find-links https://storage.googleapis.com/jax-releases/jax_nightly_releases.html
 --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html
-jax[tpu]
+jax[tpu]==0.4.31
 tensorflow
 flax
 tqdm

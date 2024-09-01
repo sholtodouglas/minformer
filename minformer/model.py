@@ -1,9 +1,13 @@
 """Minimal model definition."""
 
+import functools
 import jax
 import jax.numpy as jnp
 from flax import struct
+from collections import namedtuple
 from jax.sharding import PartitionSpec as P
+from jax.experimental.shard_map import shard_map
+from jax.experimental.pallas.ops.tpu import flash_attention
 
 def create_mesh():
     """Always 1D because only care about FSDP."""
@@ -11,15 +15,26 @@ def create_mesh():
     mesh = jax.sharding.Mesh(devices, ('x',))
     return mesh
 
-fsdp_rules = {
-    'd_model': 'x',
-    'query_heads': None,
-    'key_heads': None,
-    'key_dim': None,
-    'ffw': None,
-    'vocab': None,
-}
+ShardingRules = namedtuple('FSDPRules', ['batch', 'sequence', 'd_model', 'query_heads', 'key_heads', 'key_dim', 'ffw', 'vocab'])
 
+fsdp_rules = ShardingRules(
+    batch='x',
+    sequence=None,
+    d_model='x',
+    query_heads=None,
+    key_heads=None,
+    key_dim=None,
+    ffw=None,
+    vocab=None
+)
+
+def _logical_to_physical(logical: P, rules: ShardingRules):
+    """Converts logical to physical pspec."""
+    return P(*(getattr(rules, l) for l in logical))
+             
+def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    """Converts logical to sharding."""
+    return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
 
 @struct.dataclass
 class Config:
@@ -29,8 +44,12 @@ class Config:
     key_heads: int
     num_layers: int
     key_dim: int
-    vocab_size: int  # New field for vocabulary size
+    vocab_size: int
     causal: bool
+    use_attn_kernel: bool
+    # Sharding rules
+    rules: ShardingRules
+    mesh: jax.sharding.Mesh | None
 
 @struct.dataclass
 class Layer:
@@ -72,9 +91,9 @@ class Layer:
         )
 
     @classmethod
-    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: dict[str, str]):
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
         return jax.tree.map(
-            lambda logical: jax.sharding.NamedSharding(mesh, P(*(rules[l] for l in logical))),
+            lambda logical: _logical_to_sharding(logical, mesh, rules),
             cls.logical_axes(cfg),
         )
 
@@ -118,23 +137,28 @@ class Weights:
         )
 
     @classmethod
-    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: dict[str, str]):
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
         logical_axes = cls.logical_axes(cfg)
         return Weights(
             layers=[Layer.shardings(cfg, mesh, rules) for _ in range(cfg.num_layers)],
-            embedding=jax.sharding.NamedSharding(mesh, P(*(rules[l] for l in logical_axes.embedding))),
-            vocab_proj=jax.sharding.NamedSharding(mesh, P(*(rules[l] for l in logical_axes.vocab_proj)))
+            embedding=_logical_to_sharding(logical_axes.embedding, mesh, rules),
+            vocab_proj=_logical_to_sharding(logical_axes.vocab_proj, mesh, rules),
         )
 
     @classmethod
-    def init(cls, cfg: Config, key: jax.random.PRNGKey):
+    def init(cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, rules: ShardingRules):
         # TODO(sholto): we're repeating the map here.
-        shape = cls.shape(cfg)
-        keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
-        return Weights(layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
-            embedding=jax.random.normal(keys[-2], shape.embedding.shape, shape.embedding.dtype) / (cfg.d_model ** 0.5),
-            vocab_proj=jax.random.normal(keys[-1], shape.vocab_proj.shape, shape.vocab_proj.dtype) / (cfg.d_model ** 0.5)
- )
+        # TODO(sholto): This won't get cached? I suppose we only call it once.
+        @functools.partial(jax.jit, out_shardings=cls.shardings(cfg, mesh, rules))
+        def _init():
+            shape = cls.shape(cfg)
+            keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
+            return Weights(layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
+                embedding=jax.random.normal(keys[-2], shape.embedding.shape, shape.embedding.dtype) / (cfg.d_model ** 0.5),
+                vocab_proj=jax.random.normal(keys[-1], shape.vocab_proj.shape, shape.vocab_proj.dtype) / (cfg.d_model ** 0.5)
+            )
+        return _init()
+
 
 
 def _generate_fixed_pos_embedding(
@@ -182,52 +206,80 @@ def _generate_fixed_pos_embedding(
 def apply_rotary_embedding(x, sin, cos):
     assert x.ndim == 4
     x1, x2 = jnp.split(x, 2, axis=-1)
-    sin, cos = sin[None, :, None, :], cos[None, :, None, :] # [T, H] -> [B, T, K, H]
+    sin, cos = sin[None, None, :, :], cos[None, None, :, :] # [T, head_dim] -> [B, h, T, head_dim]
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
-def create_causal_mask(seq_len):
-    # Create a lower triangular matrix
-    mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-    # Reshape to (1, 1, seq_len, seq_len) for broadcasting
-    return mask.reshape(1, 1, seq_len, seq_len)
 
-
-def attention(q, k, v, causal=False):
+def attention(q, k, v, segment_ids, cfg: Config):
     # TODO(sholto): Stabilise with -max.
     seq_len = q.shape[1]
     # Div sqrt(key_dim)
     scale = (q.shape[-1] ** -0.5)
-    qk = jnp.einsum('bthd,bThd->bhtT', q, k) * scale
-    
-    if causal:
-        mask = create_causal_mask(seq_len)
-        qk = jnp.where(mask == 0, -1e9, qk)
-    
+    qk = jnp.einsum('bhtd,bhTd->bhtT', q, k) * scale
+    # [B, t, T]
+    segment_mask = segment_ids[:, None, :] == segment_ids[:, :, None]
+    # [B, t, T] -> [B, 1, t, T]
+    segment_mask = segment_mask[:, None, :, :]
+    if cfg.causal:
+        # [1, 1, t, T]
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))[None, None, :, :]
+        combined_mask = jnp.logical_and(segment_mask, causal_mask)
+    else:
+        combined_mask = segment_mask
+    # Apply the combined mask
+    qk = jnp.where(combined_mask, qk, -1e9)
     attn = jax.nn.softmax(qk, axis=-1)
-    return jnp.einsum('bhtT,bThd->bthd', attn, v)
+    return jnp.einsum('bhtT,bhTd->bhtd', attn, v)
+
+def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
+    """Flash attention kernel!"""
+
+    # On TPUv3, pallas seems to only work with float32.
+    q, k, v = jnp.float32(q), jnp.float32(k), jnp.float32(v)
+    @functools.partial(shard_map,
+              mesh=cfg.mesh,
+               in_specs=(
+                   _logical_to_physical(P('batch', 'query_heads', 'sequence', 'key_dim'), cfg.rules),
+                   _logical_to_physical(P('batch', 'key_heads', 'sequence',  'key_dim'), cfg.rules),
+                   _logical_to_physical(P('batch', 'key_heads', 'sequence', 'key_dim'), cfg.rules),
+                   _logical_to_physical(P('batch', 'sequence'), cfg.rules),
+                   _logical_to_physical(P('batch', 'sequence'), cfg.rules),
+               ),
+               out_specs=_logical_to_physical(P('batch','query_heads', 'sequence', 'key_dim'), cfg.rules),
+               check_rep=False)
+    def _f(q, k, v, q_segment_ids, kv_segment_ids):
+        print(q.shape)
+        print(q_segment_ids.shape)
+        segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
+        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True)
+    return _f(q, k, v, q_segment_ids, kv_segment_ids)
 
 def rms_norm(x, gamma):
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
     return gamma * x / rms
 
-def forward_layer(x, layer, sin, cos, causal: bool = True):
+def forward_layer(x, segment_ids, layer, sin, cos, cfg: Config):
     # First RMSNorm (Pre-LN for attention)
     attn_in = rms_norm(x, layer.gamma1)
     
     # Multi-head attention
-    q = jnp.einsum('btd,dhq->bthq', attn_in, layer.q)
-    k = jnp.einsum('btd,dhk->bthk', attn_in, layer.k)
-    v = jnp.einsum('btd,dhv->bthv', attn_in, layer.v)
+    q = jnp.einsum('btd,dhq->bhtq', attn_in, layer.q)
+    k = jnp.einsum('btd,dhk->bhtk', attn_in, layer.k)
+    v = jnp.einsum('btd,dhv->bhtv', attn_in, layer.v)
     
     # Apply rotary embeddings
     q = apply_rotary_embedding(q, sin, cos)
     k = apply_rotary_embedding(k, sin, cos)
     
     # Compute attention
-    attn_out = attention(q, k, v, causal=causal)
+    # TODO(sholto): seperate q/kv segment ids.
+    if cfg.use_attn_kernel:
+        attn_out = attention_kernel(q, k, v, segment_ids, segment_ids, cfg)
+    else:
+        attn_out = attention(q, k, v, segment_ids, cfg)
     
     # Project attention output
-    attn_out = jnp.einsum('bthq,hqd->btd', attn_out, layer.proj)
+    attn_out = jnp.einsum('bhtq,hqd->btd', attn_out, layer.proj)
     
     # Residual connection
     x = x + attn_out
@@ -245,7 +297,7 @@ def forward_layer(x, layer, sin, cos, causal: bool = True):
     
     return x
 
-def forward(x, weights: Weights, cfg: Config):
+def forward(x, segment_ids, weights: Weights, cfg: Config):
 
     # Embed input tokens
     x = jnp.take(weights.embedding, x, axis=0)
@@ -253,7 +305,7 @@ def forward(x, weights: Weights, cfg: Config):
     sin, cos = _generate_fixed_pos_embedding(cfg.key_dim, seq_len)
     
     for layer in weights.layers:
-        x = forward_layer(x, layer, sin, cos, cfg.causal)
+        x = forward_layer(x, segment_ids, layer, sin, cos, cfg)
     
     # Project to vocabulary size
     logits = jnp.einsum('btd,dv->btv', x, weights.vocab_proj)
@@ -265,18 +317,18 @@ def cross_entropy_loss(logits, labels):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     return -jnp.sum(labels_one_hot * log_probs, axis=-1).mean()
 
-def compute_loss(weights, x, y, cfg):
-    logits = forward(x, weights, cfg)
+def compute_loss(weights, x, segment_ids, y, cfg):
+    logits = forward(x, segment_ids, weights, cfg)
     loss = cross_entropy_loss(logits, y)
     return loss
 
-def compute_loss_and_grads(weights, x, y, cfg):
-    return jax.value_and_grad(compute_loss)(weights, x, y, cfg)
+def compute_loss_and_grads(weights, x, segment_ids, y, cfg):
+    return jax.value_and_grad(compute_loss)(weights, x, segment_ids, y, cfg)
 
 def update_weights(weights, grads, lr=3e-4):
     return jax.tree.map(lambda p, g: p - g * lr, weights, grads)
 
-def update_step(weights, x, y, cfg):
-    loss, grads = compute_loss_and_grads(weights, x, y, cfg)
+def update_step(weights, x, segment_ids, y, cfg):
+    loss, grads = compute_loss_and_grads(weights, x, segment_ids, y, cfg)
     weights = update_weights(weights, grads)
     return loss, weights
