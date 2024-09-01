@@ -1,4 +1,4 @@
-"""Tokenizes text and creates dataloader."""
+"""Tokenizes text and creates dataloader for datasets too big to fit in memory."""
 
 import numpy as np
 from typing import Dict, List, Tuple
@@ -21,13 +21,18 @@ class CharDataset:
     def __init__(self, config):
         self.config = config
         # All ASCII chars + some extra ones which appear in this dataset.
-        self.chars = list(string.printable) + ['“', '”', '’', '–']
-        self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(self.chars)}
-        self.itos: Dict[int, str] = {i: ch for i, ch in enumerate(self.chars)}
+        self.chars = list(string.printable) + ['"', '"', ''', '–', '—', ''', 'é', '…', '\xa0', 'ñ', 'à', '´']
+        self.stoi: Dict[str, int] = {ch: i+1 for i, ch in enumerate(self.chars)}  # Start from 1
+        self.stoi['<unk>'] = 0  # Add unknown token with id 0
+        self.itos: Dict[int, str] = {i+1: ch for i, ch in enumerate(self.chars)}  # Start from 1
+        self.itos[0] = '<unk>'  # Add unknown token with id 0
 
     @property
     def vocab_size(self) -> int:
         return len(self.chars)
+    
+    def tokenize(self, text):
+        return np.array([self.stoi.get(c, 0) for c in text], dtype=np.int32)
 
     @property
     def sequence_length(self) -> int:
@@ -75,7 +80,7 @@ class CharDataset:
                     # Add it to the current text.
                     current_text += parts[0] + custom_delimiter
                     # Tokenize it.
-                    tokens = np.array([self.stoi[c] for c in current_text], dtype=np.int32)
+                    tokens = self.tokenize(current_text)
                     # Now that we're done with this text, reset it.
                     current_text = ""
                     # Currently this just discards seqs too long, meh.
@@ -105,8 +110,6 @@ class CharDataset:
                         files_saved_so_far += 1
                 else:
                     current_text += line
-                if i > 5000:
-                    raise ArithmeticError
 
 
     def load_and_retokenize_tfrecord(self, file_path: str) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
