@@ -23,6 +23,8 @@ class Layer:
     proj: jax.Array
     w1: jax.Array
     w2: jax.Array
+    gamma1: jax.Array
+    gamma2: jax.Array
 
     @classmethod
     def shape(cls, cfg: Config):
@@ -32,20 +34,25 @@ class Layer:
             v=jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), jnp.bfloat16),
             proj=jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), jnp.bfloat16),
             w1=jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), jnp.bfloat16),
-            w2=jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), jnp.bfloat16)
+            w2=jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), jnp.bfloat16),
+            gamma1=jax.ShapeDtypeStruct((cfg.d_model,), jnp.bfloat16),
+            gamma2=jax.ShapeDtypeStruct((cfg.d_model,), jnp.bfloat16),
         )
 
     @classmethod
     def init(cls, cfg: Config, key: jax.random.PRNGKey):
         shape = cls.shape(cfg)
         key, *subkeys = jax.random.split(key, 7)
+
         return Layer(
-            q=jax.random.normal(subkeys[0], shape.q.shape) / (cfg.d_model ** 0.5),
-            k=jax.random.normal(subkeys[1], shape.k.shape) / (cfg.d_model ** 0.5),
-            v=jax.random.normal(subkeys[2], shape.v.shape) / (cfg.d_model ** 0.5),
-            proj=jax.random.normal(subkeys[3], shape.proj.shape) / ((cfg.query_heads * cfg.key_dim) ** 0.5),
-            w1=jax.random.normal(subkeys[4], shape.w1.shape) / (cfg.d_model ** 0.5),
-            w2=jax.random.normal(subkeys[5], shape.w2.shape) / ((cfg.d_model * cfg.ffw_multiplier) ** 0.5)
+            q=jax.random.normal(subkeys[0], shape.q.shape, shape.q.dtype) / (cfg.d_model ** 0.5),
+            k=jax.random.normal(subkeys[1], shape.k.shape, shape.k.dtype) / (cfg.d_model ** 0.5),
+            v=jax.random.normal(subkeys[2], shape.v.shape, shape.v.dtype) / (cfg.d_model ** 0.5),
+            proj=jax.random.normal(subkeys[3], shape.proj.shape, shape.proj.dtype) / ((cfg.query_heads * cfg.key_dim) ** 0.5),
+            w1=jax.random.normal(subkeys[4], shape.w1.shape, shape.w1.dtype) / (cfg.d_model ** 0.5),
+            w2=jax.random.normal(subkeys[5], shape.w2.shape, shape.w2.dtype) / ((cfg.d_model * cfg.ffw_multiplier) ** 0.5),
+            gamma1=jnp.ones(shape.gamma1.shape, shape.gamma1.dtype),
+            gamma2=jnp.ones(shape.gamma2.shape, shape.gamma2.dtype),
         )
 
 @struct.dataclass
@@ -67,8 +74,8 @@ class Weights:
         shape = cls.shape(cfg)
         keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
         return Weights(layers=[Layer.init(cfg, k) for k in keys],
-            embedding=jax.random.normal(keys[-2], shape.embedding.shape) / (cfg.d_model ** 0.5),
-            vocab_proj=jax.random.normal(keys[-1], shape.vocab_proj.shape) / (cfg.d_model ** 0.5)
+            embedding=jax.random.normal(keys[-2], shape.embedding.shape, shape.embedding.dtype) / (cfg.d_model ** 0.5),
+            vocab_proj=jax.random.normal(keys[-1], shape.vocab_proj.shape, shape.vocab_proj.dtype) / (cfg.d_model ** 0.5)
  )
 
 
@@ -130,6 +137,7 @@ def create_causal_mask(seq_len):
 def attention(q, k, v, causal=False):
     # TODO(sholto): Stabilise with -max.
     seq_len = q.shape[1]
+    # Div sqrt(key_dim)
     scale = (q.shape[-1] ** -0.5)
     qk = jnp.einsum('bthd,bThd->bhtT', q, k) * scale
     
@@ -140,14 +148,18 @@ def attention(q, k, v, causal=False):
     attn = jax.nn.softmax(qk, axis=-1)
     return jnp.einsum('bhtT,bThd->bthd', attn, v)
 
-def forward_layer(x, layer, sin, cos, causal):
+def rms_norm(x, gamma):
+    rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
+    return gamma * x / rms
 
-    # Sandwich norm!
-    x = jax.nn.standardize(x, axis=-1)
+def forward_layer(x, layer, sin, cos, causal: bool = True):
+    # First RMSNorm (Pre-LN for attention)
+    attn_in = rms_norm(x, layer.gamma1)
+    
     # Multi-head attention
-    q = jnp.einsum('btd,dhq->bthq', x, layer.q)
-    k = jnp.einsum('btd,dhk->bthk', x, layer.k)
-    v = jnp.einsum('btd,dhv->bthv', x, layer.v)
+    q = jnp.einsum('btd,dhq->bthq', attn_in, layer.q)
+    k = jnp.einsum('btd,dhk->bthk', attn_in, layer.k)
+    v = jnp.einsum('btd,dhv->bthv', attn_in, layer.v)
     
     # Apply rotary embeddings
     q = apply_rotary_embedding(q, sin, cos)
@@ -158,19 +170,20 @@ def forward_layer(x, layer, sin, cos, causal):
     
     # Project attention output
     attn_out = jnp.einsum('bthq,hqd->btd', attn_out, layer.proj)
-    attn_out = jax.nn.standardize(attn_out, axis=-1)
-    # Residual connection and layer norm
+    
+    # Residual connection
     x = x + attn_out
-    x = jax.nn.standardize(x, axis=-1)
+    
+    # Second RMSNorm (Pre-LN for FFN)
+    ff_in = rms_norm(x, layer.gamma2)
     
     # FFN
-    ff_out = jnp.einsum('btd,df->btf', x, layer.w1)
+    ff_out = jnp.einsum('btd,df->btf', ff_in, layer.w1)
     ff_out = jax.nn.gelu(ff_out)
     ff_out = jnp.einsum('btf,fd->btd', ff_out, layer.w2)
     
-    # Residual connection and layer norm
+    # Residual connection
     x = x + ff_out
-    x = jax.nn.standardize(x, axis=-1)
     
     return x
 
