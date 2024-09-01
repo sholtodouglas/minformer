@@ -212,7 +212,7 @@ def apply_rotary_embedding(x, sin, cos):
 
 def attention(q, k, v, segment_ids, cfg: Config):
     # TODO(sholto): Stabilise with -max.
-    seq_len = q.shape[1]
+    seq_len = q.shape[2]
     # Div sqrt(key_dim)
     scale = (q.shape[-1] ** -0.5)
     qk = jnp.einsum('bhtd,bhTd->bhtT', q, k) * scale
@@ -228,8 +228,8 @@ def attention(q, k, v, segment_ids, cfg: Config):
         combined_mask = segment_mask
     # Apply the combined mask
     qk = jnp.where(combined_mask, qk, -1e9)
-    attn = jax.nn.softmax(qk, axis=-1)
-    return jnp.einsum('bhtT,bhTd->bhtd', attn, v)
+    attn = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
+    return jnp.einsum('bhtT,bhTd->bhtd', attn, v).astype(jnp.bfloat16)
 
 def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     """Flash attention kernel!"""
@@ -248,11 +248,9 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
                out_specs=_logical_to_physical(P('batch','query_heads', 'sequence', 'key_dim'), cfg.rules),
                check_rep=False)
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
-        print(q.shape)
-        print(q_segment_ids.shape)
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
         return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True)
-    return _f(q, k, v, q_segment_ids, kv_segment_ids)
+    return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
 def rms_norm(x, gamma):
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
@@ -311,7 +309,7 @@ def forward(x, segment_ids, weights: Weights, cfg: Config):
     logits = jnp.einsum('btd,dv->btv', x, weights.vocab_proj)
     return logits
 
-def cross_entropy_loss(logits, labels):
+def cross_entropy_loss(logits, labels, mask):
     num_classes = logits.shape[-1]
     labels_one_hot = jax.nn.one_hot(labels, num_classes)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -319,7 +317,9 @@ def cross_entropy_loss(logits, labels):
 
 def compute_loss(weights, x, segment_ids, y, cfg):
     logits = forward(x, segment_ids, weights, cfg)
-    loss = cross_entropy_loss(logits, y)
+    # Important assumption that segment_ids 0 is 'padding'.
+    loss_mask = jnp.where(segment_ids == 0, 0, 1)
+    loss = cross_entropy_loss(logits, y, loss_mask)
     return loss
 
 def compute_loss_and_grads(weights, x, segment_ids, y, cfg):
