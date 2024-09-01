@@ -1,4 +1,8 @@
-"""Tokenizes text and creates dataloader for datasets too big to fit in memory."""
+"""Tokenizes text and creates dataloader for datasets too big to fit in memory.
+
+Reccomended dataset:
+wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
+"""
 
 import numpy as np
 from typing import Dict, List, Tuple
