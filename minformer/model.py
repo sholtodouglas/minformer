@@ -3,6 +3,23 @@
 import jax
 import jax.numpy as jnp
 from flax import struct
+from jax.sharding import PartitionSpec as P
+
+def create_mesh():
+    """Always 1D because only care about FSDP."""
+    devices = jax.devices()
+    mesh = jax.sharding.Mesh(devices, ('x',))
+    return mesh
+
+fsdp_rules = {
+    'd_model': 'x',
+    'query_heads': None,
+    'key_heads': None,
+    'key_dim': None,
+    'ffw': None,
+    'vocab': None,
+}
+
 
 @struct.dataclass
 class Config:
@@ -38,6 +55,30 @@ class Layer:
             gamma1=jax.ShapeDtypeStruct((cfg.d_model,), jnp.bfloat16),
             gamma2=jax.ShapeDtypeStruct((cfg.d_model,), jnp.bfloat16),
         )
+    
+    
+    @classmethod
+    def logical_axes(cls, cfg: Config):
+        del cfg
+        return Layer(
+            q=P('d_model', 'query_heads', 'key_dim'),
+            k=P('d_model', 'key_heads', 'key_dim'),
+            v=P('d_model', 'key_heads', 'key_dim'),
+            proj=P('query_heads', 'key_dim', 'd_model'),
+            w1=P('d_model', 'ffw'),
+            w2=P('ffw', 'd_model'),
+            gamma1=P('d_model'),
+            gamma2=P('d_model'),
+        )
+
+    @classmethod
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: dict[str, str]):
+        return jax.tree.map(
+            lambda logical: jax.sharding.NamedSharding(mesh, P(*(rules[l] for l in logical))),
+            cls.logical_axes(cfg),
+        )
+
+
 
     @classmethod
     def init(cls, cfg: Config, key: jax.random.PRNGKey):
@@ -69,11 +110,28 @@ class Weights:
             vocab_proj=jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), jnp.bfloat16))
 
     @classmethod
+    def logical_axes(cls, cfg: Config):
+        return Weights(
+            layers=[Layer.logical_axes(cfg) for _ in range(cfg.num_layers)],
+            embedding=P('vocab', 'd_model'),
+            vocab_proj=P('d_model', 'vocab')
+        )
+
+    @classmethod
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: dict[str, str]):
+        logical_axes = cls.logical_axes(cfg)
+        return Weights(
+            layers=[Layer.shardings(cfg, mesh, rules) for _ in range(cfg.num_layers)],
+            embedding=jax.sharding.NamedSharding(mesh, P(*(rules[l] for l in logical_axes.embedding))),
+            vocab_proj=jax.sharding.NamedSharding(mesh, P(*(rules[l] for l in logical_axes.vocab_proj)))
+        )
+
+    @classmethod
     def init(cls, cfg: Config, key: jax.random.PRNGKey):
         # TODO(sholto): we're repeating the map here.
         shape = cls.shape(cfg)
         keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
-        return Weights(layers=[Layer.init(cfg, k) for k in keys],
+        return Weights(layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
             embedding=jax.random.normal(keys[-2], shape.embedding.shape, shape.embedding.dtype) / (cfg.d_model ** 0.5),
             vocab_proj=jax.random.normal(keys[-1], shape.vocab_proj.shape, shape.vocab_proj.dtype) / (cfg.d_model ** 0.5)
  )
@@ -207,13 +265,18 @@ def cross_entropy_loss(logits, labels):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     return -jnp.sum(labels_one_hot * log_probs, axis=-1).mean()
 
-def compute_loss(params, x, y, cfg):
-    logits = forward(x, params, cfg)
+def compute_loss(weights, x, y, cfg):
+    logits = forward(x, weights, cfg)
     loss = cross_entropy_loss(logits, y)
     return loss
 
-def compute_loss_and_grads(params, x, y, cfg):
-    return jax.value_and_grad(compute_loss)(params, x, y, cfg)
+def compute_loss_and_grads(weights, x, y, cfg):
+    return jax.value_and_grad(compute_loss)(weights, x, y, cfg)
 
-def update_weights(params, grads, lr=3e-4):
-    return jax.tree.map(lambda p, g: p - g * lr, params, grads)
+def update_weights(weights, grads, lr=3e-4):
+    return jax.tree.map(lambda p, g: p - g * lr, weights, grads)
+
+def update_step(weights, x, y, cfg):
+    loss, grads = compute_loss_and_grads(weights, x, y, cfg)
+    weights = update_weights(weights, grads)
+    return loss, weights
