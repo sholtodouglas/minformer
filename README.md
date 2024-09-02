@@ -63,3 +63,10 @@ with trace("/tmp/profile"):
 ```
 tensorboard --logdir=/tmp/profile
 ```
+
+## Run training
+
+```
+python3 projects/charformer/train.py
+tensorboard --logdir=/tmp/logs
+```
