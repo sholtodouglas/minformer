@@ -8,6 +8,7 @@ from collections import namedtuple
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu import flash_attention
+import dataclasses
 
 def create_mesh():
     """Always 1D because only care about FSDP."""
@@ -28,6 +29,17 @@ fsdp_rules = ShardingRules(
     vocab=None
 )
 
+mdl_parallel_rules = ShardingRules(
+    batch=None,
+    sequence=None,
+    d_model=None,
+    query_heads='x',
+    key_heads='x',
+    key_dim=None,
+    ffw='x',
+    vocab=None
+)
+
 def _logical_to_physical(logical: P, rules: ShardingRules):
     """Converts logical to physical pspec."""
     return P(*(getattr(rules, l) for l in logical))
@@ -45,11 +57,15 @@ class Config:
     num_layers: int
     key_dim: int
     vocab_size: int
+    # Max seq len here can be a source of nasty bugs in incremental prefill
+    # if we overflow (since dynamic slice will shunt left instead of erroring. Fix?
+    max_seq_len: int
     causal: bool
     use_attn_kernel: bool
     # Sharding rules
     rules: ShardingRules
     mesh: jax.sharding.Mesh | None
+    
 
 @struct.dataclass
 class Layer:
@@ -160,6 +176,49 @@ class Weights:
         return _init()
 
 
+@struct.dataclass
+class KVCache:
+    k: list[jax.Array]
+    v: list[jax.Array]
+    lengths: jax.Array  # [batch_size]
+
+    @classmethod
+    def shape(cls, cfg: Config, batch_size: int, max_seq_len: int):
+        return KVCache(
+            k=[jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16) for _ in range(cfg.num_layers)],
+            v=[jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16) for _ in range(cfg.num_layers)],
+            lengths=jax.ShapeDtypeStruct((batch_size,), jnp.int32),
+        )
+
+    @classmethod
+    def logical_axes(cls, cfg: Config):
+        del cfg
+        return KVCache(
+            k=[P('batch', 'key_heads', 'sequence', 'key_dim') for _ in range(cfg.num_layers)],
+            v=[P('batch', 'key_heads', 'sequence', 'key_dim') for _ in range(cfg.num_layers)],
+            lengths=P('batch'),
+        )
+
+    @classmethod
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+        return KVCache(
+            k=[_logical_to_sharding(logical, mesh, rules) for logical in cls.logical_axes(cfg).k],
+            v=[_logical_to_sharding(logical, mesh, rules) for logical in cls.logical_axes(cfg).v],
+            lengths=_logical_to_sharding(cls.logical_axes(cfg).lengths, mesh, rules),
+        )
+
+    @classmethod
+    def init(cls, cfg: Config, batch_size: int, max_seq_len: int):
+        shape = cls.shape(cfg, batch_size, max_seq_len)
+        return KVCache(
+            k=[jnp.zeros(layer_shape.shape, layer_shape.dtype) for layer_shape in shape.k],
+            v=[jnp.zeros(layer_shape.shape, layer_shape.dtype) for layer_shape in shape.v],
+            lengths=jnp.zeros(shape.lengths.shape, shape.lengths.dtype),
+        )
+
+    @property
+    def time_axis(cls):
+        return 2
 
 def _generate_fixed_pos_embedding(
     features, length, min_timescale=1.0, max_timescale=10000.0
@@ -205,31 +264,50 @@ def _generate_fixed_pos_embedding(
 
 def apply_rotary_embedding(x, sin, cos):
     assert x.ndim == 4
+    assert sin.ndim == 3 and cos.ndim == 3
     x1, x2 = jnp.split(x, 2, axis=-1)
-    sin, cos = sin[None, None, :, :], cos[None, None, :, :] # [T, head_dim] -> [B, h, T, head_dim]
+    sin, cos = sin[:, None, :, :], cos[:, None, :, :] # [B, T, head_dim] -> [B, h, T, head_dim]
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
+# Helper functions for RoPE lookups
+def slice_at(table, index, length):
+    return jax.lax.dynamic_slice_in_dim(table, index, length)
 
-def attention(q, k, v, segment_ids, cfg: Config):
+def slices_at(table, indices, length: int):
+    return jax.vmap(functools.partial(slice_at, length=length), in_axes=(None, 0))(table, indices)
+
+
+def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal: bool):
+
+    # [B, t, T]
+    segment_mask = k_segment_ids[:, None, :] == q_segment_ids[:, :, None]
+    # [B, t, T] -> [B, 1, t, T]
+    segment_mask = segment_mask[:, None, :, :]
+
+    if causal:
+        # [b, h, t, T]
+        qk = (1, 1, q_len, k_len)
+        q_iota = jax.lax.broadcasted_iota(jnp.int32, qk, 2)
+        k_iota = jax.lax.broadcasted_iota(jnp.int32, qk, 3)
+        q_positions = q_iota + q_offset[:, None, None, None]
+        causal_mask = q_positions >= k_iota
+        combined_mask = jnp.logical_and(segment_mask, causal_mask)
+        return combined_mask
+    else:
+        return segment_mask
+
+
+def attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg: Config):
     # TODO(sholto): Stabilise with -max.
-    seq_len = q.shape[2]
     # Div sqrt(key_dim)
     scale = (q.shape[-1] ** -0.5)
     qk = jnp.einsum('bhtd,bhTd->bhtT', q, k) * scale
-    # [B, t, T]
-    segment_mask = segment_ids[:, None, :] == segment_ids[:, :, None]
-    # [B, t, T] -> [B, 1, t, T]
-    segment_mask = segment_mask[:, None, :, :]
-    if cfg.causal:
-        # [1, 1, t, T]
-        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))[None, None, :, :]
-        combined_mask = jnp.logical_and(segment_mask, causal_mask)
-    else:
-        combined_mask = segment_mask
+    mask = make_attention_mask(q.shape[2], k.shape[2], q_segment_ids, k_segment_ids, q_offset, cfg.causal)
     # Apply the combined mask
-    qk = jnp.where(combined_mask, qk, -1e9)
+    qk = jnp.where(mask, qk, -1e9)
     attn = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
     return jnp.einsum('bhtT,bhTd->bhtd', attn, v).astype(jnp.bfloat16)
+
 
 def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     """Flash attention kernel!"""
@@ -256,7 +334,7 @@ def rms_norm(x, gamma):
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
     return gamma * x / rms
 
-def forward_layer(x, segment_ids, layer, sin, cos, cfg: Config):
+def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache: KVCache | None = None):
     # First RMSNorm (Pre-LN for attention)
     attn_in = rms_norm(x, layer.gamma1)
     
@@ -268,13 +346,35 @@ def forward_layer(x, segment_ids, layer, sin, cos, cfg: Config):
     # Apply rotary embeddings
     q = apply_rotary_embedding(q, sin, cos)
     k = apply_rotary_embedding(k, sin, cos)
+
+    if cache is not None:
+        cache_k, cache_v = cache.k[idx], cache.v[idx]
+        def update(original, update, at):
+            # Axis -1 because we are in vmap.
+            return jax.lax.dynamic_update_slice_in_dim(original, update, at, axis=cache.time_axis-1)
+        # TODO(sholto): Guaranteed this introduces a gather :)
+        k, v = jax.vmap(update, in_axes=(0, 0, 0))(cache_k, jnp.bfloat16(k), cache.lengths), jax.vmap(update, in_axes=(0, 0, 0))(cache_v, jnp.bfloat16(v), cache.lengths)
+        q_segment_ids = jnp.where(segment_ids != 0, 1, 0)
+        time_indices = jnp.arange(0, v.shape[cache.time_axis])[None, :] # [1, T]
+        incremental_positions = jnp.sum(segment_ids != 0, axis=-1) # [B,]
+        # I.e. valid below where we've written things [B, T]
+        k_segment_ids = jnp.where(time_indices < (cache.lengths + incremental_positions)[:, None], 1, 0)
+        # Mask our new k and v so that its very visible and easy to test kv values being entered.
+        # Low performance!
+        k, v = k * k_segment_ids[:, None, :, None], v * k_segment_ids[:, None, :, None]
+        q_offset = cache.lengths
+    else:
+        q_segment_ids = segment_ids
+        k_segment_ids = segment_ids
+        q_offset = jnp.zeros(x.shape[0], dtype=jnp.int32)
     
     # Compute attention
     # TODO(sholto): seperate q/kv segment ids.
     if cfg.use_attn_kernel:
-        attn_out = attention_kernel(q, k, v, segment_ids, segment_ids, cfg)
+        if cache is not None: raise ValueError("Kernel is only for training.")
+        attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
     else:
-        attn_out = attention(q, k, v, segment_ids, cfg)
+        attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg)
     
     # Project attention output
     attn_out = jnp.einsum('bhtq,hqd->btd', attn_out, layer.proj)
@@ -293,27 +393,46 @@ def forward_layer(x, segment_ids, layer, sin, cos, cfg: Config):
     # Residual connection
     x = x + ff_out
     
-    return x
+    return x, k, v
 
-def forward(x, segment_ids, weights: Weights, cfg: Config):
+def forward(x, segment_ids, weights: Weights, cfg: Config, cache: KVCache | None = None):
 
-    # Embed input tokens
+    # Embed input tokens [B, T] -> [B, T D]
     x = jnp.take(weights.embedding, x, axis=0)
-    seq_len = x.shape[1]
-    sin, cos = _generate_fixed_pos_embedding(cfg.key_dim, seq_len)
+    batch, seq_len = x.shape[0], x.shape[1]
+    sin, cos = _generate_fixed_pos_embedding(cfg.key_dim, cfg.max_seq_len)
     
-    for layer in weights.layers:
-        x = forward_layer(x, segment_ids, layer, sin, cos, cfg)
+    # Apply rotary embeddings: [B, T, head_dim]
+    if cache is not None:
+        # For inference with cache, we need to index the positional embeddings
+        start_indices = cache.lengths
+    else:
+        start_indices = jnp.zeros((batch,), dtype=jnp.int32)
+
+    sin = slices_at(sin, start_indices, seq_len)
+    cos = slices_at(cos, start_indices, seq_len)
+
+    for idx, layer in enumerate(weights.layers):
+        x, k, v = forward_layer(x, segment_ids, layer, sin, cos, idx, cfg, cache)
+        if cache is not None:
+            cache.k[idx] = k
+            cache.v[idx] = v
     
     # Project to vocabulary size
     logits = jnp.einsum('btd,dv->btv', x, weights.vocab_proj)
+    if cache is not None:
+        # Sum where there is a valid segment id (i.e. non padding tokens) [B, T] -> [B,] 
+        cache = dataclasses.replace(cache, lengths=cache.lengths + jnp.sum(segment_ids != 0, axis=-1))
+        return logits, cache
     return logits
 
 def cross_entropy_loss(logits, labels, mask):
     num_classes = logits.shape[-1]
     labels_one_hot = jax.nn.one_hot(labels, num_classes)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    return -jnp.sum(labels_one_hot * log_probs, axis=-1).mean()
+    loss = -jnp.sum(labels_one_hot * log_probs, axis=-1)
+    loss *= mask
+    return loss.mean()
 
 def compute_loss(weights, x, segment_ids, y, cfg):
     logits = forward(x, segment_ids, weights, cfg)
