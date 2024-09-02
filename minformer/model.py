@@ -66,6 +66,12 @@ class Config:
     # Sharding rules
     rules: ShardingRules
     mesh: jax.sharding.Mesh | None
+    # Optimizer config
+    max_lr: float = 3e-4
+    min_lr: float = 1e-5
+    warmup_steps: int = 50
+    total_steps: int = 10000
+
     
 
 @struct.dataclass
@@ -436,6 +442,34 @@ def forward(x, segment_ids, weights: Weights, cfg: Config, cache: KVCache | None
 
 # Training.
 
+def get_lr_with_cosine_decay_and_warmup(step: int, total_steps: int, max_lr: float, min_lr: float, warmup_steps: int):
+    """Calculate learning rate using cosine decay with linear warmup.    """
+    def warmup(s):
+        return max_lr * (s / warmup_steps)
+    
+    def cosine_decay(s):
+        progress = (s - warmup_steps) / (total_steps - warmup_steps)
+        return min_lr + 0.5 * (max_lr - min_lr) * (1 + jnp.cos(jnp.pi * progress))
+    
+    return jax.lax.cond(
+        step < warmup_steps,
+        warmup,
+        cosine_decay,
+        step
+    )
+
+def adam_update(param, grad, m, v, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    m = beta1 * m + (1 - beta1) * grad
+    v = beta2 * v + (1 - beta2) * jnp.square(grad)
+    m_hat = m / (1 - beta1)
+    v_hat = v / (1 - beta2)
+    update = lr * m_hat / (jnp.sqrt(v_hat) + eps)
+    return param - update, m, v
+
+def init_adam_state(weights: Weights):
+    return jax.tree_map(lambda p: (jnp.zeros_like(p), jnp.zeros_like(p)), weights)
+
+
 def cross_entropy_loss(logits, labels, mask):
     num_classes = logits.shape[-1]
     labels_one_hot = jax.nn.one_hot(labels, num_classes)
@@ -455,13 +489,23 @@ def compute_loss(weights, x, segment_ids, y, cfg):
 def compute_loss_and_grads(weights, x, segment_ids, y, cfg):
     return jax.value_and_grad(compute_loss)(weights, x, segment_ids, y, cfg)
 
-def update_weights(weights, grads, lr=3e-3):
-    return jax.tree.map(lambda p, g: p - g * lr, weights, grads)
+def update_weights(weights, grads, state, lr):
+    def update_fn(param, grad, state):
+        m, v = state
+        param_update, m_new, v_new = adam_update(param, grad, m, v, lr)
+        return param_update, (m_new, v_new)
+    
+    updated = jax.tree_map(update_fn, weights, grads, state)
+    # Use weights for it's tree prefix.
+    new_weights = jax.tree.map(lambda _, u: u[0], weights, updated)
+    new_state = jax.tree.map(lambda _, u: u[1], weights, updated)
+    return new_weights, new_state
 
-def update_step(weights, x, segment_ids, y, cfg):
+def update_step(weights, x, segment_ids, y, opt_state, step: int, cfg: Config):
     loss, grads = compute_loss_and_grads(weights, x, segment_ids, y, cfg)
-    weights = update_weights(weights, grads)
-    return loss, weights
+    lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
+    weights, opt_state = update_weights(weights, grads, opt_state, lr)
+    return loss, weights, opt_state
 
 # Inference.
 

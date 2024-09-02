@@ -247,7 +247,11 @@ def test_overtrain_and_sample_simple_sequence():
         use_attn_kernel=True,
         weight_dtype=jnp.float32,
         rules=model.fsdp_rules,
-        mesh=model.create_mesh()
+        mesh=model.create_mesh(),
+        max_lr=3e-4,
+        min_lr=1e-5,
+        warmup_steps=10,
+        total_steps=100,
     )
 
     inference_config = model.Config(
@@ -266,6 +270,7 @@ def test_overtrain_and_sample_simple_sequence():
         mesh=model.create_mesh()
     )
     weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
+    opt_state = model.init_adam_state(weights)
     step = jax.jit(model.update_step, static_argnames='cfg')
     step = functools.partial(step, cfg=cfg)
 
@@ -277,8 +282,8 @@ def test_overtrain_and_sample_simple_sequence():
         'segment_ids': jnp.ones((8, 256)),
     }
 
-    for _ in range(0, 50):
-        _, weights = step(weights, batch['x'], batch['segment_ids'], batch['y'])
+    for s in range(0, 50):
+        _, weights, opt_state = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, s)
     
     prompt = jnp.arange(1, 60)
     cache = model.KVCache.init(cfg=inference_config, batch_size=1, max_seq_len=2048)
