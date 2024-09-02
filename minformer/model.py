@@ -351,61 +351,71 @@ def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache:
 
     # Cast layer to bfloat16 for faster operations.
     # layer = jax.tree.map(lambda x: jnp.bfloat16(x), layer)
-    attn_in = rms_norm(x, layer.gamma1)
+    with jax.named_scope('attn_pre_norm'):
+        attn_in = rms_norm(x, layer.gamma1)
     
     # Multi-head attention
-    q = jnp.einsum('btd,dhq->bhtq', attn_in, layer.q)
-    k = jnp.einsum('btd,dhk->bhtk', attn_in, layer.k)
-    v = jnp.einsum('btd,dhv->bhtv', attn_in, layer.v)
+    with jax.named_scope('qkv_matmul'):
+        q = jnp.einsum('btd,dhq->bhtq', attn_in, layer.q)
+        k = jnp.einsum('btd,dhk->bhtk', attn_in, layer.k)
+        v = jnp.einsum('btd,dhv->bhtv', attn_in, layer.v)
     
     # Apply rotary embeddings
-    q = apply_rotary_embedding(q, sin, cos)
-    k = apply_rotary_embedding(k, sin, cos)
+    with jax.named_scope('rope'):
+        q = apply_rotary_embedding(q, sin, cos)
+        k = apply_rotary_embedding(k, sin, cos)
 
-    if cache is not None:
-        cache_k, cache_v = cache.k[idx], cache.v[idx]
-        def update(original, update, at):
-            # Axis -1 because we are in vmap.
-            return jax.lax.dynamic_update_slice_in_dim(original, update, at, axis=cache.time_axis-1)
-        # TODO(sholto): Guaranteed this introduces a gather :)
-        k, v = jax.vmap(update, in_axes=(0, 0, 0))(cache_k, k.astype(cache_k.dtype), cache.lengths), jax.vmap(update, in_axes=(0, 0, 0))(cache_v, v.astype(cache_v.dtype), cache.lengths)
-        q_segment_ids = jnp.where(segment_ids != 0, 1, 0)
-        time_indices = jnp.arange(0, v.shape[cache.time_axis])[None, :] # [1, T]
-        incremental_positions = jnp.sum(segment_ids != 0, axis=-1) # [B,]
-        # I.e. valid below where we've written things [B, T]
-        k_segment_ids = jnp.where(time_indices < (cache.lengths + incremental_positions)[:, None], 1, 0)
-        # Mask our new k and v so that its very visible and easy to test kv values being entered.
-        # Low performance!
-        k, v = k * k_segment_ids[:, None, :, None], v * k_segment_ids[:, None, :, None]
-        q_offset = cache.lengths
-    else:
-        q_segment_ids = segment_ids
-        k_segment_ids = segment_ids
-        q_offset = jnp.zeros(x.shape[0], dtype=jnp.int32)
+    with jax.named_scope('cache_update'):
+        if cache is not None:
+            cache_k, cache_v = cache.k[idx], cache.v[idx]
+            def update(original, update, at):
+                # Axis -1 because we are in vmap.
+                return jax.lax.dynamic_update_slice_in_dim(original, update, at, axis=cache.time_axis-1)
+            # TODO(sholto): Guaranteed this introduces a gather :)
+            k, v = jax.vmap(update, in_axes=(0, 0, 0))(cache_k, k.astype(cache_k.dtype), cache.lengths), jax.vmap(update, in_axes=(0, 0, 0))(cache_v, v.astype(cache_v.dtype), cache.lengths)
+            q_segment_ids = jnp.where(segment_ids != 0, 1, 0)
+            time_indices = jnp.arange(0, v.shape[cache.time_axis])[None, :] # [1, T]
+            incremental_positions = jnp.sum(segment_ids != 0, axis=-1) # [B,]
+            # I.e. valid below where we've written things [B, T]
+            k_segment_ids = jnp.where(time_indices < (cache.lengths + incremental_positions)[:, None], 1, 0)
+            # Mask our new k and v so that its very visible and easy to test kv values being entered.
+            # Low performance!
+            k, v = k * k_segment_ids[:, None, :, None], v * k_segment_ids[:, None, :, None]
+            q_offset = cache.lengths
+        else:
+            q_segment_ids = segment_ids
+            k_segment_ids = segment_ids
+            q_offset = jnp.zeros(x.shape[0], dtype=jnp.int32)
     
     # Compute attention
-    if cfg.use_attn_kernel:
-        if cache is not None: raise ValueError("Kernel is only for training.")
-        attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
-    else:
-        attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg)
-    
+    with jax.named_scope('attention'):
+        if cfg.use_attn_kernel:
+            if cache is not None: raise ValueError("Kernel is only for training.")
+            attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
+        else:
+            attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg)
+        
     # Project attention output
-    attn_out = jnp.einsum('bhtq,hqd->btd', attn_out, layer.proj)
+    with jax.named_scope('projection'):
+        attn_out = jnp.einsum('bhtq,hqd->btd', attn_out, layer.proj)
     
     # Residual connection
-    x = x + attn_out
+    with jax.named_scope('residual'):
+        x = x + attn_out
     
     # Second RMSNorm (Pre-LN for FFN)
-    ff_in = rms_norm(x, layer.gamma2)
+    with jax.named_scope('ffn_pre_norm'): 
+        ff_in = rms_norm(x, layer.gamma2)
     
     # FFN
-    ff_out = jnp.einsum('btd,df->btf', ff_in, layer.w1)
-    ff_out = jax.nn.gelu(ff_out)
-    ff_out = jnp.einsum('btf,fd->btd', ff_out, layer.w2)
+    with jax.named_scope('ffw'):
+        ff_out = jnp.einsum('btd,df->btf', ff_in, layer.w1)
+        ff_out = jax.nn.gelu(ff_out)
+        ff_out = jnp.einsum('btf,fd->btd', ff_out, layer.w2)
     
     # Residual connection
-    x = x + ff_out
+    with jax.named_scope('residual'):
+        x = x + ff_out   
     
     return x, k, v
 
@@ -506,6 +516,15 @@ def update_step(weights, x, segment_ids, y, opt_state, step: int, cfg: Config):
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
     weights, opt_state = update_weights(weights, grads, opt_state, lr)
     return loss, weights, opt_state
+
+def input_shardings(mesh, rules) -> tuple[jax.sharding.NamedSharding, jax.sharding.NamedSharding, jax.sharding.NamedSharding]:
+    logical_axes = {
+        'x': P('batch', 'sequence'),
+        'segment_ids': P('batch', 'sequence'),
+        'y': P('batch', 'sequence'),
+    }
+    return jax.tree.map(functools.partial(_logical_to_sharding, mesh=mesh, rules=rules), logical_axes)
+
 
 # Inference.
 

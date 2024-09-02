@@ -281,8 +281,10 @@ def test_overtrain_and_sample_simple_sequence():
         'y': test_batch[:, 1:],
         'segment_ids': jnp.ones((8, 256)),
     }
+    
 
     for s in range(0, 50):
+        batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
         _, weights, opt_state = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, s)
     
     prompt = jnp.arange(1, 60)

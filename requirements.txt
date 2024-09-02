@@ -6,3 +6,4 @@ flax
 tqdm
 numpy
 ipywidgets
+tensorboard-plugin-profile

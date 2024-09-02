@@ -47,3 +47,19 @@ You can then use the remote editor to edit code, and push/pull to sync.
 
 
 pip3 install -r requirements.txt
+
+
+## Profiling
+
+%pip install tensorboard-plugin-profile
+
+```
+from jax.profiler import trace
+with trace("/tmp/profile"):
+    loss, weights, opt_state = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, 0)
+    jax.block_until_ready(loss)
+```
+
+```
+tensorboard --logdir=/tmp/profile
+```
