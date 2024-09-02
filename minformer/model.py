@@ -9,6 +9,7 @@ from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu import flash_attention
 import dataclasses
+from typing import Any
 
 def create_mesh():
     """Always 1D because only care about FSDP."""
@@ -185,12 +186,12 @@ class Weights:
 
 @struct.dataclass
 class KVCache:
-    k: list[jax.Array]
-    v: list[jax.Array]
+    k: list[jax.Array] # (batch_size, key_heads, max_seq_len, key_dim)
+    v: list[jax.Array] # (batch_size, key_heads, max_seq_len, key_dim)
     lengths: jax.Array  # [batch_size]
 
     @classmethod
-    def shape(cls, cfg: Config, batch_size: int, max_seq_len: int):
+    def shape(cls, cfg: Config, batch_size: int, max_seq_len: int) -> 'KVCache':
         return KVCache(
             k=[jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16) for _ in range(cfg.num_layers)],
             v=[jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16) for _ in range(cfg.num_layers)],
@@ -198,7 +199,7 @@ class KVCache:
         )
 
     @classmethod
-    def logical_axes(cls, cfg: Config):
+    def logical_axes(cls, cfg: Config)  -> 'KVCache':
         del cfg
         return KVCache(
             k=[P('batch', 'key_heads', 'sequence', 'key_dim') for _ in range(cfg.num_layers)],
@@ -207,7 +208,7 @@ class KVCache:
         )
 
     @classmethod
-    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules) -> 'KVCache':
         return KVCache(
             k=[_logical_to_sharding(logical, mesh, rules) for logical in cls.logical_axes(cfg).k],
             v=[_logical_to_sharding(logical, mesh, rules) for logical in cls.logical_axes(cfg).v],
@@ -215,7 +216,7 @@ class KVCache:
         )
 
     @classmethod
-    def init(cls, cfg: Config, batch_size: int, max_seq_len: int):
+    def init(cls, cfg: Config, batch_size: int, max_seq_len: int) -> 'KVCache':
         shape = cls.shape(cfg, batch_size, max_seq_len)
         return KVCache(
             k=[jnp.zeros(layer_shape.shape, layer_shape.dtype) for layer_shape in shape.k],
@@ -224,12 +225,12 @@ class KVCache:
         )
 
     @property
-    def time_axis(cls):
+    def time_axis(cls) -> int:
         return 2
 
 def _generate_fixed_pos_embedding(
     features, length, min_timescale=1.0, max_timescale=10000.0
-):
+) -> tuple[jax.Array, jax.Array]:
   """Generate Sin/Cos for Rotary Embeddings.
 
   Generates sinusoids at (features//2) different timescales, where the
@@ -304,8 +305,22 @@ def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, ca
         return segment_mask
 
 
-def attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg: Config):
-    # TODO(sholto): Stabilise with -max.
+def attention(q: jax.Array, k: jax.Array, v: jax.Array, q_segment_ids: jax.Array, k_segment_ids: jax.Array, q_offset: jax.Array, cfg: Config) -> jax.Array:
+    """
+    Compute attention.
+
+    Args:
+    q: Query tensor of shape (batch_size, num_heads, q_len, head_dim)
+    k: Key tensor of shape (batch_size, num_heads, k_len, head_dim)
+    v: Value tensor of shape (batch_size, num_heads, k_len, head_dim)
+    q_segment_ids: Query segment IDs of shape (batch_size, q_len)
+    k_segment_ids: Key segment IDs of shape (batch_size, k_len)
+    q_offset: Query offset of shape (batch_size,)
+    cfg: Configuration object
+
+    Returns:
+    Attention output of shape (batch_size, num_heads, q_len, head_dim)
+    """
     # Div sqrt(key_dim)
     scale = (q.shape[-1] ** -0.5)
     qk = jnp.einsum('bhtd,bhTd->bhtT', q, k) * scale
@@ -342,11 +357,12 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
         return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale)
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
-def rms_norm(x, gamma):
+def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
+    """Apply RMS normalization."""
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
     return gamma * x / rms
 
-def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache: KVCache | None = None):
+def forward_layer(x: jax.Array, segment_ids: jax.Array, layer: Layer, sin: jax.Array, cos: jax.Array, idx: int, cfg: Config, cache: KVCache | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     # First RMSNorm (Pre-LN for attention)
 
     # Cast layer to bfloat16 for faster operations.
@@ -419,7 +435,7 @@ def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache:
     
     return x, k, v
 
-def forward(x, segment_ids, weights: Weights, cfg: Config, cache: KVCache | None = None):
+def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None):
 
     internals = {}
     # Embed input tokens [B, T] -> [B, T D]
@@ -469,7 +485,7 @@ def get_lr_with_cosine_decay_and_warmup(step: int, total_steps: int, max_lr: flo
         step
     )
 
-def adam_update(param, grad, m, v, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+def adam_update(param: jax.Array, grad: jax.Array, m: jax.Array, v: jax.Array, lr: float, beta1=0.9, beta2=0.999, eps=1e-8):
     m = beta1 * m + (1 - beta1) * grad
     v = beta2 * v + (1 - beta2) * jnp.square(grad)
     m_hat = m / (1 - beta1)
@@ -481,7 +497,7 @@ def init_adam_state(weights: Weights):
     return jax.tree_map(lambda p: (jnp.zeros_like(p), jnp.zeros_like(p)), weights)
 
 
-def cross_entropy_loss(logits, labels, mask):
+def cross_entropy_loss(logits: jax.Array, labels: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:
     num_classes = logits.shape[-1]
     labels_one_hot = jax.nn.one_hot(labels, num_classes)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -497,7 +513,7 @@ def cross_entropy_loss(logits, labels, mask):
     accuracy = correct_predictions / valid_tokens
     return loss, accuracy
 
-def compute_loss(weights, x, segment_ids, y, cfg):
+def compute_loss(weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, cfg: Config) -> tuple[jax.Array, Any]:
     logits, internals = forward(x, segment_ids, weights, cfg)
     # Important assumption that segment_ids 0 is 'padding'.
     loss_mask = jnp.where(segment_ids == 0, 0, 1)
@@ -505,7 +521,7 @@ def compute_loss(weights, x, segment_ids, y, cfg):
     internals['accuracy'] = accuracy
     return loss, internals
 
-def update_weights(weights, grads, state, lr):
+def update_weights(weights: Weights, grads: Weights, state: Any, lr: float):
     def update_fn(param, grad, state):
         m, v = state
         param_update, m_new, v_new = adam_update(param, grad, m, v, lr)
@@ -517,7 +533,7 @@ def update_weights(weights, grads, state, lr):
     new_state = jax.tree.map(lambda _, u: u[1], weights, updated)
     return new_weights, new_state
 
-def update_step(weights, x, segment_ids, y, opt_state, step: int, cfg: Config):
+def update_step(weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, opt_state: Any, step: int, cfg: Config):
     (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg)
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
     weights, opt_state = update_weights(weights, grads, opt_state, lr)
@@ -536,6 +552,7 @@ def input_shardings(mesh, rules) -> tuple[jax.sharding.NamedSharding, jax.shardi
 
 # Inference.
 def prepare_chunk(chunk, pad_to: int, pad_id: int):
+    # [length] -> [1, padded]
     chunk = jnp.pad(chunk, (0, pad_to-len(chunk)))[None, :]
     segment_ids = jnp.where(chunk != pad_id, 1, 0).astype(jnp.int32)
     return chunk, segment_ids
