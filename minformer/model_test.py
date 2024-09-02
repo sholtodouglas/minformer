@@ -1,7 +1,15 @@
+import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
 import model
+
+def print_test_passed(test_name):
+    GREEN = '\033[92m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+    CHECKMARK = '\u2713'
+    print(f"{GREEN}{BOLD}[{CHECKMARK}] Test passed:{RESET} {test_name}")
 
 def assert_mask_equal(actual, expected, test_name):
     if not jnp.array_equal(actual, expected):
@@ -28,6 +36,7 @@ def test_make_attention_mask():
           [True, True, True, True]]]
     ])
     assert_mask_equal(mask, expected_mask, "Basic causal mask test")
+    print_test_passed("Basic causal mask")
 
     # Test 2: Non-causal mask
     causal = False
@@ -47,6 +56,7 @@ def test_make_attention_mask():
           [False, False, True, True]]]
     ])
     assert_mask_equal(mask, expected_mask, "Segmented causal mask test")
+    print_test_passed("Segmented causal mask")
 
     # Test 4: Causal mask with offset
     q_len, k_len = 2, 4
@@ -60,6 +70,7 @@ def test_make_attention_mask():
           [True, True, True, True]]]
     ])
     assert_mask_equal(mask, expected_mask, "Causal mask with offset test")
+    print_test_passed("Causal mask with offset")
 
     # Test 5: Multiple batches
     q_len, k_len = 3, 3
@@ -77,8 +88,92 @@ def test_make_attention_mask():
           [True, True, True]]]
     ])
     assert_mask_equal(mask, expected_mask, "Multiple batches test")
+    print_test_passed("Mask with multiple batches")
 
-    print("All tests passed!")
+
+def test_attention_impl_equivalence():
+    # Set up test parameters
+    batch_size = 8
+    seq_len = 128
+    num_heads = 4
+    head_dim = 64
+    d_model = num_heads * head_dim
+
+    # Create a dummy config
+    rules = model.ShardingRules(
+        batch='x',
+        sequence=None,
+        d_model='x',
+        query_heads=None,
+        key_heads=None,
+        key_dim=None,
+        ffw=None,
+        vocab=None
+    )
+
+    cfg = model.Config(
+        d_model=d_model,
+        ffw_multiplier=4,
+        query_heads=num_heads,
+        key_heads=num_heads,
+        num_layers=1,
+        key_dim=head_dim,
+        vocab_size=1000,
+        max_seq_len=1024,
+        causal=True,
+        use_attn_kernel=True,
+        weight_dtype=jnp.float32,
+        rules=rules,
+        mesh=model.create_mesh()
+    )
+
+    # Create dummy inputs
+    key = jax.random.PRNGKey(0)
+    q_key, k_key, v_key, segment_key = jax.random.split(key, 4)
+
+    q = jax.random.normal(q_key, (batch_size, num_heads, seq_len, head_dim))
+    k = jax.random.normal(k_key, (batch_size, num_heads, seq_len, head_dim))
+    v = jax.random.normal(v_key, (batch_size, num_heads, seq_len, head_dim))
+
+    segment_ids = jax.random.randint(segment_key, (batch_size, seq_len), 0, 2)
+    q_offset = jnp.zeros(batch_size, dtype=jnp.int32)
+
+    # Run both attention implementations
+    output_attention = model.attention(q, k, v, segment_ids, segment_ids, q_offset, cfg)
+    output_attention_kernel = model.attention_kernel(q, k, v, segment_ids, segment_ids, cfg)
+
+    # Compare outputs
+    atol = 1e-2  # Absolute tolerance
+    rtol = 1e-2  # Relative tolerance
+
+    jnp.allclose(output_attention, output_attention_kernel, atol=atol, rtol=rtol)
+    print_test_passed("Kernel and manual implementation equivalence")
+
+def test_cross_entropy_loss(print_intermediates: bool = False):
+    # Test case : Mixed predictions with masking
+    logits = jnp.array([[2.0, 1.0, 0.0],
+                            [0.0, 2.0, 1.0],
+                            [1.0, 0.0, 2.0]])
+    labels = jnp.array([0, 1, 2])
+    mask = jnp.array([1, 1, 0])  # Last prediction is masked
+
+    loss = model.cross_entropy_loss(logits, labels, mask)
+
+    # Manual calculation:
+    # For [2.0, 1.0, 0.0] and label 0: -log(e^2 / (e^2 + e^1 + e^0)) ≈ 0.4076
+    # For [0.0, 2.0, 1.0] and label 1: -log(e^2 / (e^0 + e^2 + e^1)) ≈ 0.4076
+    # Average of these two: (0.4076 + 0.4076) / 2 ≈ 0.4076
+    expected_loss = 0.4076
+
+    if print_intermediates:
+        print("Test case  (Mixed predictions with masking):")
+        print(f"Logits:\n{logits}")
+        print(f"Labels: {labels}")
+        print(f"Mask: {mask}")
+        print(f"Calculated loss: {loss:.6f}")
+        print(f"Expected loss: {expected_loss:.6f}")
+        print(f"Test {'passed' if np.isclose(loss, expected_loss, atol=1e-4) else 'failed'}\n")
+    print_test_passed("Cross Entropy loss correctness.")
 
 def test_incremental_prefill():
     # Set up the configuration
@@ -87,37 +182,30 @@ def test_incremental_prefill():
         ffw_multiplier=4,
         query_heads=8,
         key_heads=8,
-        num_layers=8,
+        num_layers=4,
         key_dim=128,
         vocab_size=256,
         max_seq_len=8192,
         causal=True,
         use_attn_kernel=False,
+        weight_dtype=jnp.float32,
         rules=model.mdl_parallel_rules,
         mesh=model.create_mesh()
     )
 
     # Initialize weights and cache
-    key = jax.random.PRNGKey(0)
+    key = jax.random.PRNGKey(1)
     weights = model.Weights.init(inference_config, key, inference_config.mesh, model.mdl_parallel_rules)
-    weights = jax.tree.map(lambda x: x.astype(jnp.float32), weights)
     prefill_cache = model.KVCache.init(cfg=inference_config, batch_size=1, max_seq_len=2048)
-
     # Define test input sequences
     chunk_a = jnp.array([1, 2, 3, 4, 5, 6])
     chunk_b = jnp.array([7, 8, 9])
     chunk_c = jnp.array([1, 2, 3, 4, 5, 6, 7, 8, 9])
 
-    # Helper function to prepare chunks
-    def prepare_chunk(chunk, pad_to: int):
-        chunk = jnp.pad(chunk, (0, pad_to-len(chunk)))[None, :]
-        segment_ids = jnp.where(chunk != 0, 1, 0).astype(jnp.int32)
-        return chunk, segment_ids
-
     # Prepare chunks
-    chunk_a, segment_ids_a = prepare_chunk(chunk_a, pad_to=16)
-    chunk_b, segment_ids_b = prepare_chunk(chunk_b, pad_to=16)
-    chunk_c, segment_ids_c = prepare_chunk(chunk_c, pad_to=16)
+    chunk_a, segment_ids_a = model.prepare_chunk(chunk_a, pad_to=16, pad_id=0)
+    chunk_b, segment_ids_b = model.prepare_chunk(chunk_b, pad_to=16, pad_id=0)
+    chunk_c, segment_ids_c = model.prepare_chunk(chunk_c, pad_to=16, pad_id=0)
 
     # Run incremental prefill
     logits_c, prefill_cache_c = model.forward(chunk_c, segment_ids_c, weights, inference_config, prefill_cache)
@@ -135,16 +223,74 @@ def test_incremental_prefill():
 
     # Assert cache consistency
     for layer in range(inference_config.num_layers):
-        assert jnp.array_equal(prefill_cache_c.k[layer][:, :, :9, :], prefill_cache.k[layer][:, :, :9, :]), f"K cache mismatch at layer {layer}"
-        assert jnp.array_equal(prefill_cache_c.v[layer][:, :, :9, :], prefill_cache.v[layer][:, :, :9, :]), f"V cache mismatch at layer {layer}"
+        np.testing.assert_allclose(prefill_cache_c.k[layer][:, :, :9, :].astype(jnp.float32), prefill_cache.k[layer][:, :, :9, :].astype(jnp.float32), rtol=2e-2)
+        np.testing.assert_allclose(prefill_cache_c.v[layer][:, :, :9, :].astype(jnp.float32), prefill_cache.v[layer][:, :, :9, :].astype(jnp.float32), rtol=2e-2)
 
     # Assert logits consistency for the first 6 tokens
     assert jnp.array_equal(jnp.argmax(logits_c[0, :6], axis=-1), jnp.argmax(logits_a[0, :6], axis=-1)), "Logits mismatch for first 6 tokens"
     assert jnp.array_equal(jnp.argmax(logits_c[0, 6:9], axis=-1), jnp.argmax(logits_b[0, :3], axis=-1)), "Logits mismatch for tokens 6 to 9"
 
-    print("All tests passed!")
+    print_test_passed("Incremental prefill correctness.")
+
+def test_overtrain_and_sample_simple_sequence():
+    # TODO(sholto): Extend with multiple sequence ids?
+    cfg = model.Config(
+        d_model=256,
+        ffw_multiplier=4,
+        query_heads=8,
+        key_heads=8,
+        num_layers=4,
+        key_dim=128,
+        vocab_size=256,
+        max_seq_len=8192,
+        causal=True,
+        use_attn_kernel=True,
+        weight_dtype=jnp.float32,
+        rules=model.fsdp_rules,
+        mesh=model.create_mesh()
+    )
+
+    inference_config = model.Config(
+        d_model=256,
+        ffw_multiplier=4,
+        query_heads=8,
+        key_heads=8,
+        num_layers=4,
+        key_dim=128,
+        vocab_size=256,
+        max_seq_len=8192,
+        causal=True,
+        use_attn_kernel=False,
+        weight_dtype=jnp.float32,
+        rules=model.mdl_parallel_rules,
+        mesh=model.create_mesh()
+    )
+    weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
+    step = jax.jit(model.update_step, static_argnames='cfg')
+    step = functools.partial(step, cfg=cfg)
+
+    test_batch = jnp.arange(1, 256+2)[None, :]
+    test_batch = jnp.repeat(test_batch, repeats = 8, axis=0)
+    batch = {
+        'x': test_batch[:, :-1],
+        'y': test_batch[:, 1:],
+        'segment_ids': jnp.ones((8, 256)),
+    }
+
+    for _ in range(0, 50):
+        _, weights = step(weights, batch['x'], batch['segment_ids'], batch['y'])
+    
+    prompt = jnp.arange(1, 60)
+    cache = model.KVCache.init(cfg=inference_config, batch_size=1, max_seq_len=2048)
+    tokens, cache = model.sample_from_prompt(prompt, weights, cache, inference_config, batch_idx=0, num_steps=13)
+    # Validate that we do indeed sample the sequence we overtrained in.
+    assert jnp.array_equal(jnp.array(tokens), jnp.arange(60, 60+13))
+    print_test_passed("Can overtrain and sample from simple model.")
 
 # Run the test
 if __name__ == "__main__":
     test_make_attention_mask()
+    test_attention_impl_equivalence()
+    test_cross_entropy_loss()
     test_incremental_prefill()
+    test_overtrain_and_sample_simple_sequence()

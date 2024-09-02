@@ -62,6 +62,7 @@ class Config:
     max_seq_len: int
     causal: bool
     use_attn_kernel: bool
+    weight_dtype: jnp.float32
     # Sharding rules
     rules: ShardingRules
     mesh: jax.sharding.Mesh | None
@@ -121,14 +122,14 @@ class Layer:
         key, *subkeys = jax.random.split(key, 7)
 
         return Layer(
-                q=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=(1,2))(subkeys[0], shape.q.shape, dtype=jnp.bfloat16),
-                k=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=(1,2))(subkeys[1], shape.k.shape, dtype=jnp.bfloat16),
-                v=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=(1,2))(subkeys[2], shape.v.shape, dtype=jnp.bfloat16),
-                proj=jax.nn.initializers.glorot_normal(in_axis=(0,1), out_axis=2)(subkeys[3], shape.proj.shape, dtype=jnp.bfloat16),
-                w1=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=1)(subkeys[4], shape.w1.shape, dtype=jnp.bfloat16),
-                w2=jax.nn.initializers.glorot_normal(in_axis=1, out_axis=0)(subkeys[5], shape.w2.shape, dtype=jnp.bfloat16),
-                gamma1=jnp.ones(shape.gamma1.shape, dtype=jnp.bfloat16),
-                gamma2=jnp.ones(shape.gamma2.shape, dtype=jnp.bfloat16),
+                q=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))(subkeys[0], shape.q.shape, dtype=cfg.weight_dtype),
+                k=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))(subkeys[1], shape.k.shape, dtype=cfg.weight_dtype),
+                v=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))(subkeys[2], shape.v.shape, dtype=cfg.weight_dtype),
+                proj=jax.nn.initializers.he_normal(in_axis=(0,1), out_axis=2)(subkeys[3], shape.proj.shape, dtype=cfg.weight_dtype),
+                w1=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(subkeys[4], shape.w1.shape, dtype=cfg.weight_dtype),
+                w2=jax.nn.initializers.he_normal(in_axis=1, out_axis=0)(subkeys[5], shape.w2.shape, dtype=cfg.weight_dtype),
+                gamma1=jnp.ones(shape.gamma1.shape, dtype=cfg.weight_dtype),
+                gamma2=jnp.ones(shape.gamma2.shape, dtype=cfg.weight_dtype),
         )
 
 @struct.dataclass
@@ -141,8 +142,8 @@ class Weights:
     @classmethod
     def shape(cls, cfg: Config):
         return Weights(layers=[Layer.shape(cfg) for _ in range(cfg.num_layers)],
-            embedding=jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), jnp.bfloat16),
-            vocab_proj=jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), jnp.bfloat16))
+            embedding=jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), jnp.float32),
+            vocab_proj=jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), jnp.float32))
 
     @classmethod
     def logical_axes(cls, cfg: Config):
@@ -170,8 +171,8 @@ class Weights:
             shape = cls.shape(cfg)
             keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
             return Weights(layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
-                embedding=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=1)(keys[-2], shape.embedding.shape, dtype=jnp.bfloat16),
-                vocab_proj=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=1)(keys[-1], shape.vocab_proj.shape, dtype=jnp.bfloat16)
+                embedding=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-2], shape.embedding.shape, dtype=jnp.bfloat16),
+                vocab_proj=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-1], shape.vocab_proj.shape, dtype=jnp.bfloat16)
             )
         return _init()
 
@@ -280,7 +281,7 @@ def slices_at(table, indices, length: int):
 def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal: bool):
 
     # [B, t, T]
-    segment_mask = k_segment_ids[:, None, :] == q_segment_ids[:, :, None]
+    segment_mask = q_segment_ids[:, :, None] == k_segment_ids[:, None, :]
     # [B, t, T] -> [B, 1, t, T]
     segment_mask = segment_mask[:, None, :, :]
 
@@ -304,6 +305,10 @@ def attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg: Config):
     qk = jnp.einsum('bhtd,bhTd->bhtT', q, k) * scale
     mask = make_attention_mask(q.shape[2], k.shape[2], q_segment_ids, k_segment_ids, q_offset, cfg.causal)
     # Apply the combined mask
+
+    max_score = jnp.max(qk, axis=-1, keepdims=True)
+    # Subtract max to stabilise.
+    qk = qk - max_score # [b,h,t,T]
     qk = jnp.where(mask, qk, -1e9)
     attn = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
     return jnp.einsum('bhtT,bhTd->bhtd', attn, v).astype(jnp.bfloat16)
@@ -314,6 +319,7 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
 
     # On TPUv3, pallas seems to only work with float32.
     q, k, v = jnp.float32(q), jnp.float32(k), jnp.float32(v)
+    scale = (q.shape[-1] ** -0.5)
     @functools.partial(shard_map,
               mesh=cfg.mesh,
                in_specs=(
@@ -327,7 +333,7 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
                check_rep=False)
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True)
+        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale)
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
 def rms_norm(x, gamma):
@@ -336,6 +342,9 @@ def rms_norm(x, gamma):
 
 def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache: KVCache | None = None):
     # First RMSNorm (Pre-LN for attention)
+
+    # Cast layer to bfloat16 for faster operations.
+    # layer = jax.tree.map(lambda x: jnp.bfloat16(x), layer)
     attn_in = rms_norm(x, layer.gamma1)
     
     # Multi-head attention
@@ -369,7 +378,6 @@ def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache:
         q_offset = jnp.zeros(x.shape[0], dtype=jnp.int32)
     
     # Compute attention
-    # TODO(sholto): seperate q/kv segment ids.
     if cfg.use_attn_kernel:
         if cache is not None: raise ValueError("Kernel is only for training.")
         attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
@@ -398,7 +406,7 @@ def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache:
 def forward(x, segment_ids, weights: Weights, cfg: Config, cache: KVCache | None = None):
 
     # Embed input tokens [B, T] -> [B, T D]
-    x = jnp.take(weights.embedding, x, axis=0)
+    x = weights.embedding[x, :]
     batch, seq_len = x.shape[0], x.shape[1]
     sin, cos = _generate_fixed_pos_embedding(cfg.key_dim, cfg.max_seq_len)
     
@@ -426,13 +434,16 @@ def forward(x, segment_ids, weights: Weights, cfg: Config, cache: KVCache | None
         return logits, cache
     return logits
 
+# Training.
+
 def cross_entropy_loss(logits, labels, mask):
     num_classes = logits.shape[-1]
     labels_one_hot = jax.nn.one_hot(labels, num_classes)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     loss = -jnp.sum(labels_one_hot * log_probs, axis=-1)
     loss *= mask
-    return loss.mean()
+    # Compute mean over valid values.
+    return loss.sum() / jnp.sum(mask)
 
 def compute_loss(weights, x, segment_ids, y, cfg):
     logits = forward(x, segment_ids, weights, cfg)
@@ -444,7 +455,7 @@ def compute_loss(weights, x, segment_ids, y, cfg):
 def compute_loss_and_grads(weights, x, segment_ids, y, cfg):
     return jax.value_and_grad(compute_loss)(weights, x, segment_ids, y, cfg)
 
-def update_weights(weights, grads, lr=3e-4):
+def update_weights(weights, grads, lr=3e-3):
     return jax.tree.map(lambda p, g: p - g * lr, weights, grads)
 
 def update_step(weights, x, segment_ids, y, cfg):
@@ -452,15 +463,38 @@ def update_step(weights, x, segment_ids, y, cfg):
     weights = update_weights(weights, grads)
     return loss, weights
 
-def prepare_chunk(chunk, pad_to: int):
+# Inference.
+
+def prepare_chunk(chunk, pad_to: int, pad_id: int):
     chunk = jnp.pad(chunk, (0, pad_to-len(chunk)))[None, :]
-    segment_ids = jnp.where(chunk != 0, 1, 0).astype(jnp.int32)
+    segment_ids = jnp.where(chunk != pad_id, 1, 0).astype(jnp.int32)
     return chunk, segment_ids
 
-def sample_next_token(logits, temperature=1.0):
-    # Apply temperature
-    logits = logits / temperature
-    # Convert to probabilities
-    probs = jax.nn.softmax(logits, axis=-1)
-    # Sample from the distribution
-    return jax.random.categorical(jax.random.PRNGKey(0), probs, axis=-1)
+def sample_next_token(logits, temperature=1.0, greedy: bool = True):
+
+    if greedy:
+        return jnp.argmax(logits -1)
+    else:
+        # Apply temperature
+        logits = logits / temperature
+        # Convert to probabilities
+        probs = jax.nn.softmax(logits, axis=-1)
+        # Sample from the distribution
+        return jax.random.categorical(jax.random.PRNGKey(0), probs, axis=-1)
+
+def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, batch_idx: int = 0, num_steps: int = 20, pad_prompt: int = 64):
+    """Samples from a prompt."""
+    prompt, prompt_segment_ids = prepare_chunk(tokens, pad_to=pad_prompt, pad_id=0)
+    # TODO(sholto): Proper power of 2 padding and insert logic.
+    cache = dataclasses.replace(cache, lengths=jax.lax.dynamic_update_index_in_dim(cache.lengths, 0, batch_idx, axis=0))
+    logits, cache = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
+    next_token_logit = logits[batch_idx, cache.lengths[batch_idx]-1, :]
+
+    tokens = []
+    for _ in range(0, num_steps):
+        next_token = sample_next_token(next_token_logit)[None]
+        tokens.append(next_token[0])
+        prompt, prompt_segment_ids = prepare_chunk(next_token, pad_to=1, pad_id=0)
+        logits, cache = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
+        next_token_logit = logits[batch_idx, 0, :]
+    return tokens, cache
