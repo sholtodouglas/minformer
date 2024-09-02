@@ -177,8 +177,8 @@ class Weights:
             shape = cls.shape(cfg)
             keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
             return Weights(layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
-                embedding=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-2], shape.embedding.shape, dtype=jnp.bfloat16),
-                vocab_proj=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-1], shape.vocab_proj.shape, dtype=jnp.bfloat16)
+                embedding=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-2], shape.embedding.shape, dtype=cfg.weight_dtype),
+                vocab_proj=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-1], shape.vocab_proj.shape, dtype=cfg.weight_dtype)
             )
         return _init()
 
@@ -421,6 +421,7 @@ def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache:
 
 def forward(x, segment_ids, weights: Weights, cfg: Config, cache: KVCache | None = None):
 
+    internals = {}
     # Embed input tokens [B, T] -> [B, T D]
     x = weights.embedding[x, :]
     batch, seq_len = x.shape[0], x.shape[1]
@@ -447,8 +448,8 @@ def forward(x, segment_ids, weights: Weights, cfg: Config, cache: KVCache | None
     if cache is not None:
         # Sum where there is a valid segment id (i.e. non padding tokens) [B, T] -> [B,] 
         cache = dataclasses.replace(cache, lengths=cache.lengths + jnp.sum(segment_ids != 0, axis=-1))
-        return logits, cache
-    return logits
+        return logits, cache, internals
+    return logits, internals
 
 # Training.
 
@@ -486,18 +487,23 @@ def cross_entropy_loss(logits, labels, mask):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     loss = -jnp.sum(labels_one_hot * log_probs, axis=-1)
     loss *= mask
+
+    valid_tokens = jnp.sum(mask)
     # Compute mean over valid values.
-    return loss.sum() / jnp.sum(mask)
+    loss = loss.sum() / valid_tokens
+
+    predictions = jnp.argmax(logits, axis=-1)
+    correct_predictions = jnp.sum((predictions == labels) * mask)
+    accuracy = correct_predictions / valid_tokens
+    return loss, accuracy
 
 def compute_loss(weights, x, segment_ids, y, cfg):
-    logits = forward(x, segment_ids, weights, cfg)
+    logits, internals = forward(x, segment_ids, weights, cfg)
     # Important assumption that segment_ids 0 is 'padding'.
     loss_mask = jnp.where(segment_ids == 0, 0, 1)
-    loss = cross_entropy_loss(logits, y, loss_mask)
-    return loss
-
-def compute_loss_and_grads(weights, x, segment_ids, y, cfg):
-    return jax.value_and_grad(compute_loss)(weights, x, segment_ids, y, cfg)
+    loss, accuracy = cross_entropy_loss(logits, y, loss_mask)
+    internals['accuracy'] = accuracy
+    return loss, internals
 
 def update_weights(weights, grads, state, lr):
     def update_fn(param, grad, state):
@@ -512,10 +518,12 @@ def update_weights(weights, grads, state, lr):
     return new_weights, new_state
 
 def update_step(weights, x, segment_ids, y, opt_state, step: int, cfg: Config):
-    loss, grads = compute_loss_and_grads(weights, x, segment_ids, y, cfg)
+    (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg)
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
     weights, opt_state = update_weights(weights, grads, opt_state, lr)
-    return loss, weights, opt_state
+    internals['grad_norms'] = jax.tree.map(jnp.linalg.norm, grads)
+    internals['lr'] = lr
+    return loss, weights, opt_state, internals
 
 def input_shardings(mesh, rules) -> tuple[jax.sharding.NamedSharding, jax.sharding.NamedSharding, jax.sharding.NamedSharding]:
     logical_axes = {
@@ -527,7 +535,6 @@ def input_shardings(mesh, rules) -> tuple[jax.sharding.NamedSharding, jax.shardi
 
 
 # Inference.
-
 def prepare_chunk(chunk, pad_to: int, pad_id: int):
     chunk = jnp.pad(chunk, (0, pad_to-len(chunk)))[None, :]
     segment_ids = jnp.where(chunk != pad_id, 1, 0).astype(jnp.int32)
@@ -550,7 +557,7 @@ def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg:
     prompt, prompt_segment_ids = prepare_chunk(tokens, pad_to=pad_prompt, pad_id=0)
     # TODO(sholto): Proper power of 2 padding and insert logic.
     cache = dataclasses.replace(cache, lengths=jax.lax.dynamic_update_index_in_dim(cache.lengths, 0, batch_idx, axis=0))
-    logits, cache = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
+    logits, cache, _ = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
     next_token_logit = logits[batch_idx, cache.lengths[batch_idx]-1, :]
 
     tokens = []
@@ -558,6 +565,6 @@ def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg:
         next_token = sample_next_token(next_token_logit)[None]
         tokens.append(next_token[0])
         prompt, prompt_segment_ids = prepare_chunk(next_token, pad_to=1, pad_id=0)
-        logits, cache = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
+        logits, cache, _ = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
         next_token_logit = logits[batch_idx, 0, :]
     return tokens, cache
