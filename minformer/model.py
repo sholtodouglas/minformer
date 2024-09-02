@@ -9,7 +9,9 @@ from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu import flash_attention
 import dataclasses
+import orbax.checkpoint as ocp
 from typing import Any
+ 
 
 def create_mesh():
     """Always 1D because only care about FSDP."""
@@ -167,6 +169,16 @@ class Weights:
             layers=[Layer.shardings(cfg, mesh, rules) for _ in range(cfg.num_layers)],
             embedding=_logical_to_sharding(logical_axes.embedding, mesh, rules),
             vocab_proj=_logical_to_sharding(logical_axes.vocab_proj, mesh, rules),
+        )
+
+    @classmethod
+    def abstract(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+        return jax.tree.map(
+            lambda shape, shd: jax.ShapeDtypeStruct(
+                shape.shape, shape.dtype, sharding=shd
+            ),
+            Weights.shape(cfg),
+            Weights.shardings(cfg, mesh, rules)
         )
 
     @classmethod
@@ -494,7 +506,12 @@ def adam_update(param: jax.Array, grad: jax.Array, m: jax.Array, v: jax.Array, l
     return param - update, m, v
 
 def init_adam_state(weights: Weights):
-    return jax.tree_map(lambda p: (jnp.zeros_like(p), jnp.zeros_like(p)), weights)
+    def _zeros_like(old):
+        if isinstance(old, jax.ShapeDtypeStruct):
+            return jax.ShapeDtypeStruct(old.shape, old.dtype, sharding=old.sharding)
+        else:
+            return jax.device_put(jnp.zeros_like(old), old.sharding)
+    return jax.tree_map(lambda p: (_zeros_like(p), _zeros_like(p)), weights)
 
 
 def cross_entropy_loss(logits: jax.Array, labels: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -548,6 +565,28 @@ def input_shardings(mesh, rules) -> tuple[jax.sharding.NamedSharding, jax.shardi
         'y': P('batch', 'sequence'),
     }
     return jax.tree.map(functools.partial(_logical_to_sharding, mesh=mesh, rules=rules), logical_axes)
+
+# Checkpointing logic
+def make_mgnr(path='/tmp/checkpoint_manager_sharded', save_internal: int = 1, erase: bool = True):
+    if erase:
+        path = ocp.test_utils.erase_and_create_empty(path)
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=save_internal)
+    mngr = ocp.CheckpointManager(path, options=options)
+    return mngr
+
+def save(mngr: ocp.CheckpointManager, weights: Weights, opt_state: Any, step: float):
+    mngr.save(step, args=ocp.args.StandardSave({'weights': weights, 'opt_state': opt_state, 'step': jnp.array([step,], dtype=jnp.int32)}))
+    mngr.wait_until_finished()
+
+def load(mngr: ocp.CheckpointManager, cfg: Config):
+    abstract_weights = Weights.abstract(cfg, cfg.mesh, cfg.rules)
+    abstract_opt_state = init_adam_state(abstract_weights)
+    abstract_step = jax.ShapeDtypeStruct([1,], dtype=jnp.int32, sharding=None)
+    restored = mngr.restore(
+        mngr.latest_step(),
+        args=ocp.args.StandardRestore({'weights': abstract_weights, 'opt_state': abstract_opt_state, 'step': abstract_step}),
+    )
+    return restored['weights'], restored['opt_state'], restored['step'][0].item()
 
 
 # Inference.

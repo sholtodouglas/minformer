@@ -9,3 +9,4 @@ ipywidgets
 tensorboard-plugin-profile
 tensorboard
 tensorboardX
+orbax
