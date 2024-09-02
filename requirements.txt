@@ -7,3 +7,5 @@ tqdm
 numpy
 ipywidgets
 tensorboard-plugin-profile
+tensorboard
+tensorboardX
