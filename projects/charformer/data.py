@@ -37,6 +37,16 @@ class CharDataset:
     
     def tokenize(self, text):
         return np.array([self.stoi.get(c, 0) for c in text], dtype=np.int32)
+    
+    def detokenize(self, tokens):
+        assert tokens.ndim == 1
+        def _detok(tok):
+            if tok in self.itos:
+                return self.itos[tok]
+            else:
+                return '<oob>'
+        return ''.join([_detok(int(token)) for token in tokens])
+
 
     @property
     def sequence_length(self) -> int:
@@ -147,7 +157,7 @@ class CharDataset:
                 if s != 0:
                     min_max = np.where(segment_ids == s)[0]
                     min_idx, max_idx = min_max[0], min_max[-1]
-                    original_text = ''.join([self.itos[token] for token in x[min_idx:max_idx]])
+                    original_text = self.detokenize(x[min_idx:max_idx])
                     retokenized_data.append(original_text)
         
         return retokenized_data

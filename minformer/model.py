@@ -121,14 +121,14 @@ class Layer:
         key, *subkeys = jax.random.split(key, 7)
 
         return Layer(
-            q=jax.random.normal(subkeys[0], shape.q.shape, shape.q.dtype) / (cfg.d_model ** 0.5),
-            k=jax.random.normal(subkeys[1], shape.k.shape, shape.k.dtype) / (cfg.d_model ** 0.5),
-            v=jax.random.normal(subkeys[2], shape.v.shape, shape.v.dtype) / (cfg.d_model ** 0.5),
-            proj=jax.random.normal(subkeys[3], shape.proj.shape, shape.proj.dtype) / ((cfg.query_heads * cfg.key_dim) ** 0.5),
-            w1=jax.random.normal(subkeys[4], shape.w1.shape, shape.w1.dtype) / (cfg.d_model ** 0.5),
-            w2=jax.random.normal(subkeys[5], shape.w2.shape, shape.w2.dtype) / ((cfg.d_model * cfg.ffw_multiplier) ** 0.5),
-            gamma1=jnp.ones(shape.gamma1.shape, shape.gamma1.dtype),
-            gamma2=jnp.ones(shape.gamma2.shape, shape.gamma2.dtype),
+                q=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=(1,2))(subkeys[0], shape.q.shape, dtype=jnp.bfloat16),
+                k=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=(1,2))(subkeys[1], shape.k.shape, dtype=jnp.bfloat16),
+                v=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=(1,2))(subkeys[2], shape.v.shape, dtype=jnp.bfloat16),
+                proj=jax.nn.initializers.glorot_normal(in_axis=(0,1), out_axis=2)(subkeys[3], shape.proj.shape, dtype=jnp.bfloat16),
+                w1=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=1)(subkeys[4], shape.w1.shape, dtype=jnp.bfloat16),
+                w2=jax.nn.initializers.glorot_normal(in_axis=1, out_axis=0)(subkeys[5], shape.w2.shape, dtype=jnp.bfloat16),
+                gamma1=jnp.ones(shape.gamma1.shape, dtype=jnp.bfloat16),
+                gamma2=jnp.ones(shape.gamma2.shape, dtype=jnp.bfloat16),
         )
 
 @struct.dataclass
@@ -170,8 +170,8 @@ class Weights:
             shape = cls.shape(cfg)
             keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
             return Weights(layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
-                embedding=jax.random.normal(keys[-2], shape.embedding.shape, shape.embedding.dtype) / (cfg.d_model ** 0.5),
-                vocab_proj=jax.random.normal(keys[-1], shape.vocab_proj.shape, shape.vocab_proj.dtype) / (cfg.d_model ** 0.5)
+                embedding=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=1)(keys[-2], shape.embedding.shape, dtype=jnp.bfloat16),
+                vocab_proj=jax.nn.initializers.glorot_normal(in_axis=0, out_axis=1)(keys[-1], shape.vocab_proj.shape, dtype=jnp.bfloat16)
             )
         return _init()
 
@@ -353,7 +353,7 @@ def forward_layer(x, segment_ids, layer, sin, cos, idx: int, cfg: Config, cache:
             # Axis -1 because we are in vmap.
             return jax.lax.dynamic_update_slice_in_dim(original, update, at, axis=cache.time_axis-1)
         # TODO(sholto): Guaranteed this introduces a gather :)
-        k, v = jax.vmap(update, in_axes=(0, 0, 0))(cache_k, jnp.bfloat16(k), cache.lengths), jax.vmap(update, in_axes=(0, 0, 0))(cache_v, jnp.bfloat16(v), cache.lengths)
+        k, v = jax.vmap(update, in_axes=(0, 0, 0))(cache_k, k.astype(cache_k.dtype), cache.lengths), jax.vmap(update, in_axes=(0, 0, 0))(cache_v, v.astype(cache_v.dtype), cache.lengths)
         q_segment_ids = jnp.where(segment_ids != 0, 1, 0)
         time_indices = jnp.arange(0, v.shape[cache.time_axis])[None, :] # [1, T]
         incremental_positions = jnp.sum(segment_ids != 0, axis=-1) # [B,]
@@ -451,3 +451,16 @@ def update_step(weights, x, segment_ids, y, cfg):
     loss, grads = compute_loss_and_grads(weights, x, segment_ids, y, cfg)
     weights = update_weights(weights, grads)
     return loss, weights
+
+def prepare_chunk(chunk, pad_to: int):
+    chunk = jnp.pad(chunk, (0, pad_to-len(chunk)))[None, :]
+    segment_ids = jnp.where(chunk != 0, 1, 0).astype(jnp.int32)
+    return chunk, segment_ids
+
+def sample_next_token(logits, temperature=1.0):
+    # Apply temperature
+    logits = logits / temperature
+    # Convert to probabilities
+    probs = jax.nn.softmax(logits, axis=-1)
+    # Sample from the distribution
+    return jax.random.categorical(jax.random.PRNGKey(0), probs, axis=-1)
