@@ -518,12 +518,15 @@ def init_adam_state(weights: Weights):
     return jax.tree_map(lambda p: (_zeros_like(p), _zeros_like(p)), weights)
 
 
-def cross_entropy_loss(logits: jax.Array, labels: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:
+def cross_entropy_loss(logits: jax.Array, labels: jax.Array, mask: jax.Array, internals: jax.Array | None = None) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, Any]:
     num_classes = logits.shape[-1]
     labels_one_hot = jax.nn.one_hot(labels, num_classes)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     loss = -jnp.sum(labels_one_hot * log_probs, axis=-1)
     loss *= mask
+
+    if internals is not None:
+        internals['per_token_loss'] = loss
 
     valid_tokens = jnp.sum(mask)
     # Compute mean over valid values.
@@ -532,13 +535,15 @@ def cross_entropy_loss(logits: jax.Array, labels: jax.Array, mask: jax.Array) ->
     predictions = jnp.argmax(logits, axis=-1)
     correct_predictions = jnp.sum((predictions == labels) * mask)
     accuracy = correct_predictions / valid_tokens
-    return loss, accuracy
+
+    
+    return (loss, accuracy) if internals is None else (loss, accuracy, internals)
 
 def compute_loss(weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, cfg: Config) -> tuple[jax.Array, Any]:
     logits, internals = forward(x, segment_ids, weights, cfg)
     # Important assumption that segment_ids 0 is 'padding'.
     loss_mask = jnp.where(segment_ids == 0, 0, 1)
-    loss, accuracy = cross_entropy_loss(logits, y, loss_mask)
+    loss, accuracy, internals = cross_entropy_loss(logits, y, loss_mask, internals)
     internals['accuracy'] = accuracy
     return loss, internals
 

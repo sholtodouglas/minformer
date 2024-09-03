@@ -1,6 +1,8 @@
 """Script for running training with TensorBoard logging, configurable parameters, and configuration tracking."""
 import sys
+from typing import Any
 sys.path.append('../minformer')
+
 import jax
 import jax.numpy as jnp
 import os
@@ -8,6 +10,7 @@ import functools
 import argparse
 from tensorboardX import SummaryWriter
 import data as data
+import utils as charformer_utils
 import minformer.model as model
 from datetime import datetime
 
@@ -27,6 +30,7 @@ def parse_args():
     parser.add_argument("--total_steps", type=int, default=100000, help="Total number of training steps")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
+    parser.add_argument("--eval_every", type=int, default=100, help="Eval step every N steps")
     parser.add_argument("--data_dir", type=str, default='data/tfrecords/', help="Directory containing TFRecord files")
     parser.add_argument("--log_dir", type=str, default="/tmp/logs/charformer_training", help="Base directory for TensorBoard logs")
     parser.add_argument("--log_weight_histograms", default=False, action="store_true", help="Enable logging of weight histograms")
@@ -60,6 +64,14 @@ def log_weight_histograms(writer, weights, step):
     for key, value in flat_weights:
         if isinstance(value, jnp.ndarray):
             writer.add_histogram(key, value, step)
+
+def eval_batch(batch: Any, dataset: data.CharDataset, weights: model.Weights, writer: SummaryWriter, step: int, cfg: model.Config, batch_row: int = 0):
+    _, internals = model.compute_loss(weights, batch['x'], batch['segment_ids'], batch['y'], cfg)
+    losses = internals['per_token_loss']
+    length = jnp.sum(batch['segment_ids'][batch_row] != 0) - 1
+    text = dataset.detokenize(batch['y'][batch_row, :length])
+    losses = losses[batch_row, :length]
+    charformer_utils.visualize_token_prediction_difficulty(text, losses, save_image=True, writer=writer, step=step)
 
 def main():
     args = parse_args()
@@ -113,6 +125,7 @@ def main():
         weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
         opt_state = model.init_adam_state(weights)
         start_step = 0
+        print("Initialization done.")
 
 
     # JIT-compile the update step
@@ -140,6 +153,9 @@ def main():
         for i in range(start_step, cfg.total_steps):
             batch = next(iter)
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
+            if i % args.eval_every == 0:
+                eval_batch(batch, ds, weights, writer, i, cfg)
+
             loss, weights, opt_state, internals = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, i)
             
             if i % args.log_every == 0:
