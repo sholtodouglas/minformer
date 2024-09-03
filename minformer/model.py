@@ -616,7 +616,7 @@ def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg:
 
     # Calculate the next power of 2 for padding, up to cfg.max_seq.
     assert len(tokens) <= cfg.max_seq_len
-    pad_to = min(2 ** math.ceil(math.log2((len(tokens)))))
+    pad_to = 2 ** math.ceil(math.log2((len(tokens))))
     prompt, prompt_segment_ids = prepare_chunk(tokens, pad_to=pad_to, pad_id=0)
     cache = dataclasses.replace(cache, lengths=jax.lax.dynamic_update_index_in_dim(cache.lengths, 0, batch_idx, axis=0))
     logits, cache, _ = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
