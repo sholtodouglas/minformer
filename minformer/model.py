@@ -1,6 +1,7 @@
 """Minimal model definition."""
 
 import functools
+import math
 import jax
 import jax.numpy as jnp
 from flax import struct
@@ -610,10 +611,13 @@ def sample_next_token(logits, temperature=1.0, greedy: bool = True):
         # Sample from the distribution
         return jax.random.categorical(jax.random.PRNGKey(0), probs, axis=-1)
 
-def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, batch_idx: int = 0, num_steps: int = 20, pad_prompt: int = 64):
+def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, batch_idx: int = 0, num_steps: int = 20):
     """Samples from a prompt."""
-    prompt, prompt_segment_ids = prepare_chunk(tokens, pad_to=pad_prompt, pad_id=0)
-    # TODO(sholto): Proper power of 2 padding and insert logic.
+
+    # Calculate the next power of 2 for padding, up to cfg.max_seq.
+    assert len(tokens) <= cfg.max_seq_len
+    pad_to = min(2 ** math.ceil(math.log2((len(tokens)))))
+    prompt, prompt_segment_ids = prepare_chunk(tokens, pad_to=pad_to, pad_id=0)
     cache = dataclasses.replace(cache, lengths=jax.lax.dynamic_update_index_in_dim(cache.lengths, 0, batch_idx, axis=0))
     logits, cache, _ = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
     next_token_logit = logits[batch_idx, cache.lengths[batch_idx]-1, :]
