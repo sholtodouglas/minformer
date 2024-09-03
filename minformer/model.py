@@ -91,14 +91,14 @@ class Layer:
     @classmethod
     def shape(cls, cfg: Config):
         return Layer(
-            q=jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), jnp.bfloat16),
-            k=jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), jnp.bfloat16),
-            v=jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), jnp.bfloat16),
-            proj=jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), jnp.bfloat16),
-            w1=jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), jnp.bfloat16),
-            w2=jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), jnp.bfloat16),
-            gamma1=jax.ShapeDtypeStruct((cfg.d_model,), jnp.bfloat16),
-            gamma2=jax.ShapeDtypeStruct((cfg.d_model,), jnp.bfloat16),
+            q=jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype),
+            k=jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
+            v=jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
+            proj=jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), cfg.weight_dtype),
+            w1=jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype),
+            w2=jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), cfg.weight_dtype),
+            gamma1=jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
+            gamma2=jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
         )
     
     
@@ -129,6 +129,7 @@ class Layer:
     def init(cls, cfg: Config, key: jax.random.PRNGKey):
         shape = cls.shape(cfg)
         key, *subkeys = jax.random.split(key, 7)
+
 
         return Layer(
                 q=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))(subkeys[0], shape.q.shape, dtype=cfg.weight_dtype),
@@ -182,10 +183,7 @@ class Weights:
         )
 
     @classmethod
-    def init(cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, rules: ShardingRules):
-        # TODO(sholto): we're repeating the map here.
-        # TODO(sholto): This won't get cached? I suppose we only call it once.
-        @functools.partial(jax.jit, out_shardings=cls.shardings(cfg, mesh, rules))
+    def init(cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, rules: ShardingRules, use_low_mem_init: bool = False):
         def _init():
             shape = cls.shape(cfg)
             keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
@@ -193,7 +191,12 @@ class Weights:
                 embedding=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-2], shape.embedding.shape, dtype=cfg.weight_dtype),
                 vocab_proj=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-1], shape.vocab_proj.shape, dtype=cfg.weight_dtype)
             )
-        return _init()
+
+        # This takes ~10-20s instead of 0.1s to init, but will init sharded. Use this when the
+        # weights would be too big for one device.
+        if use_low_mem_init:
+            _init = jax.jit(_init, out_shardings=cls.shardings(cfg, mesh, rules))
+        return jax.device_put(_init(), cls.shardings(cfg, mesh, rules))
 
 
 @struct.dataclass
@@ -567,26 +570,25 @@ def input_shardings(mesh, rules) -> tuple[jax.sharding.NamedSharding, jax.shardi
     return jax.tree.map(functools.partial(_logical_to_sharding, mesh=mesh, rules=rules), logical_axes)
 
 # Checkpointing logic
-def make_mgnr(path='/tmp/checkpoint_manager_sharded', save_internal: int = 1, erase: bool = True):
+def make_mgnr(path='/tmp/checkpoint_manager_sharded', erase: bool = False):
     if erase:
         path = ocp.test_utils.erase_and_create_empty(path)
-    options = ocp.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=save_internal)
+    options = ocp.CheckpointManagerOptions(max_to_keep=3)
     mngr = ocp.CheckpointManager(path, options=options)
     return mngr
 
-def save(mngr: ocp.CheckpointManager, weights: Weights, opt_state: Any, step: float):
-    mngr.save(step, args=ocp.args.StandardSave({'weights': weights, 'opt_state': opt_state, 'step': jnp.array([step,], dtype=jnp.int32)}))
+def save(mngr: ocp.CheckpointManager, weights: Weights, opt_state: Any, step: int):
+    mngr.save(step, args=ocp.args.StandardSave({'weights': weights, 'opt_state': opt_state}))
     mngr.wait_until_finished()
 
-def load(mngr: ocp.CheckpointManager, cfg: Config):
+def load(mngr: ocp.CheckpointManager, cfg: Config, step: int | None = None):
     abstract_weights = Weights.abstract(cfg, cfg.mesh, cfg.rules)
     abstract_opt_state = init_adam_state(abstract_weights)
-    abstract_step = jax.ShapeDtypeStruct([1,], dtype=jnp.int32, sharding=None)
     restored = mngr.restore(
-        mngr.latest_step(),
-        args=ocp.args.StandardRestore({'weights': abstract_weights, 'opt_state': abstract_opt_state, 'step': abstract_step}),
+        mngr.latest_step() if step is None else step,
+        args=ocp.args.StandardRestore({'weights': abstract_weights, 'opt_state': abstract_opt_state}),
     )
-    return restored['weights'], restored['opt_state'], restored['step'][0].item()
+    return restored['weights'], restored['opt_state']
 
 
 # Inference.

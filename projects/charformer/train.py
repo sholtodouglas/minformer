@@ -30,6 +30,9 @@ def parse_args():
     parser.add_argument("--data_dir", type=str, default='data/tfrecords/', help="Directory containing TFRecord files")
     parser.add_argument("--log_dir", type=str, default="/tmp/logs/charformer_training", help="Base directory for TensorBoard logs")
     parser.add_argument("--log_weight_histograms", default=False, action="store_true", help="Enable logging of weight histograms")
+    parser.add_argument("--checkpoint_dir", type=str, default="/tmp/charformer_checkpoints", help="Directory for saving checkpoints")
+    parser.add_argument("--checkpoint_interval", type=int, default=-1, help="Save checkpoint every N steps")
+    parser.add_argument("--resume_from_checkpoint", action="store_true", help="Resume training from the latest checkpoint")
     return parser.parse_args()
 
 def clean_key(key):
@@ -97,10 +100,20 @@ def main():
     for field in cfg.__dataclass_fields__:
         print(f"{field}: {getattr(cfg, field)}")
 
-    # Initialize weights and optimizer state
-    weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
-    opt_state = model.init_adam_state(weights)
-    print('Initialised weights.')
+    # Checkpoint manager setup
+    ckpt_manager = model.make_mgnr(path=args.checkpoint_dir)
+
+    # Initialize or load weights and optimizer state
+    if args.resume_from_checkpoint:
+        print("Resuming from checkpoint...")
+        weights, opt_state = model.load(ckpt_manager, cfg)
+        start_step = ckpt_manager.latest_step()
+    else:
+        print("Initializing new weights...")
+        weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
+        opt_state = model.init_adam_state(weights)
+        start_step = 0
+
 
     # JIT-compile the update step
     step = jax.jit(model.update_step, static_argnames='cfg')
@@ -122,7 +135,7 @@ def main():
             'max_seq_len': cfg.max_seq_len,
         }, {})
 
-        for i in range(cfg.total_steps):
+        for i in range(start_step, cfg.total_steps):
             batch = next(iter)
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
             loss, weights, opt_state, internals = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, i)
@@ -136,6 +149,11 @@ def main():
                 # Log weight histograms if enabled
                 if args.log_weight_histograms:
                     log_weight_histograms(writer, weights, i)
+            
+            # Save checkpoint
+            if i % args.checkpoint_interval == 0 and args.checkpoint_interval != -1:
+                print(f"Saving checkpoint at step {i}")
+                model.save(ckpt_manager, weights, opt_state, i)
 
             # Optional: Add code here to save checkpoints periodically
 

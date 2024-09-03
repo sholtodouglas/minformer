@@ -194,7 +194,7 @@ def test_incremental_prefill():
     )
 
     # Initialize weights and cache
-    key = jax.random.PRNGKey(1)
+    key = jax.random.PRNGKey(2)
     weights = model.Weights.init(inference_config, key, inference_config.mesh, model.mdl_parallel_rules)
     prefill_cache = model.KVCache.init(cfg=inference_config, batch_size=1, max_seq_len=2048)
     # Define test input sequences
@@ -281,18 +281,34 @@ def test_overtrain_and_sample_simple_sequence():
         'y': test_batch[:, 1:],
         'segment_ids': jnp.ones((8, 256)),
     }
-    
+    batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
+    ckpt_path = '/tmp/test_dir'
+    ckpt_manager = model.make_mgnr(path=ckpt_path, erase=True)
+    
+    losses = []
     for s in range(0, 50):
-        batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
-        _, weights, opt_state, internals = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, s)
+        loss, weights, opt_state, _ = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, s)
+        losses.append(loss)
+
+        if s % 25 == 0:
+            model.save(ckpt_manager, weights, opt_state, s)
     
     prompt = jnp.arange(1, 60)
     cache = model.KVCache.init(cfg=inference_config, batch_size=1, max_seq_len=2048)
     tokens, cache = model.sample_from_prompt(prompt, weights, cache, inference_config, batch_idx=0, num_steps=13)
     # Validate that we do indeed sample the sequence we overtrained in.
     assert jnp.array_equal(jnp.array(tokens), jnp.arange(60, 60+13))
-    print_test_passed("Can overtrain and sample from simple model.")
+    print_test_passed("Overtrain and sample from simple model.")
+
+    weights, opt_state = model.load(ckpt_manager, cfg, step=25)
+    new_losses = []
+    for s in range(26, 50):
+        loss, weights, opt_state, _ = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, s)
+        new_losses.append(loss)
+    assert losses[26:50] == new_losses[0:24]
+    print_test_passed("Reload mid-run checkpoint with identical training continuation.")
+
 
 # Run the test
 if __name__ == "__main__":
