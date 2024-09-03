@@ -135,6 +135,8 @@ def main():
             'max_seq_len': cfg.max_seq_len,
         }, {})
 
+        # TODO(sholto): If we want identical restart from mid training we need to step the
+        # iterator or get a read pointer-able dataset.
         for i in range(start_step, cfg.total_steps):
             batch = next(iter)
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
