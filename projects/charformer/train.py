@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument("--total_steps", type=int, default=100000, help="Total number of training steps")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
-    parser.add_argument("--eval_every", type=int, default=100, help="Eval step every N steps")
+    parser.add_argument("--eval_every", type=int, default=1000, help="Eval step every N steps")
     parser.add_argument("--data_dir", type=str, default='data/tfrecords/', help="Directory containing TFRecord files")
     parser.add_argument("--log_dir", type=str, default="/tmp/logs/charformer_training", help="Base directory for TensorBoard logs")
     parser.add_argument("--log_weight_histograms", default=False, action="store_true", help="Enable logging of weight histograms")

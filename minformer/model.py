@@ -344,9 +344,9 @@ def attention(q: jax.Array, k: jax.Array, v: jax.Array, q_segment_ids: jax.Array
     # Apply the combined mask
 
     max_score = jnp.max(qk, axis=-1, keepdims=True)
-    # Subtract max to stabilise.
-    qk = qk - max_score # [b,h,t,T]
-    qk = jnp.where(mask, qk, -1e9)
+    qk = jnp.where(mask, qk, -1e30)
+    # Jax softmax impl includes max subtraction for numerical stability, no need to
+    # do it outside.
     attn = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
     return jnp.einsum('bhtT,bhTd->bhtd', attn, v).astype(jnp.bfloat16)
 
@@ -410,8 +410,7 @@ def forward_layer(x: jax.Array, segment_ids: jax.Array, layer: Layer, sin: jax.A
             incremental_positions = jnp.sum(segment_ids != 0, axis=-1) # [B,]
             # I.e. valid below where we've written things [B, T]
             k_segment_ids = jnp.where(time_indices < (cache.lengths + incremental_positions)[:, None], 1, 0)
-            # Mask our new k and v so that its very visible and easy to test kv values being entered.
-            # Low performance!
+            # Mask our new k and v so that its very visible and easy to test kv values being entered. Tiny perf hit b/c it is unnecessary.
             k, v = k * k_segment_ids[:, None, :, None], v * k_segment_ids[:, None, :, None]
             q_offset = cache.lengths
         else:
@@ -501,11 +500,16 @@ def get_lr_with_cosine_decay_and_warmup(step: int, total_steps: int, max_lr: flo
         step
     )
 
-def adam_update(param: jax.Array, grad: jax.Array, m: jax.Array, v: jax.Array, lr: float, beta1=0.9, beta2=0.999, eps=1e-8):
+def adam_update(param: jax.Array, grad: jax.Array, m: jax.Array, v: jax.Array, lr: float, t: int, beta1=0.9, beta2=0.999, eps=1e-8):
+    # Momentum.
     m = beta1 * m + (1 - beta1) * grad
+    # Grad variance.
     v = beta2 * v + (1 - beta2) * jnp.square(grad)
-    m_hat = m / (1 - beta1)
-    v_hat = v / (1 - beta2)
+    # Debiasing (helps with early training).
+    m_hat = m / (1 - beta1**(t+1))
+    v_hat = v / (1 - beta2**(t+1))
+    # Adjusts the gradient update w/ momentum by the variance. Effectively
+    # high variance = more cautious step, low variance = more aggressive step.
     update = lr * m_hat / (jnp.sqrt(v_hat) + eps)
     return param - update, m, v
 
@@ -547,10 +551,10 @@ def compute_loss(weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.
     internals['accuracy'] = accuracy
     return loss, internals
 
-def update_weights(weights: Weights, grads: Weights, state: Any, lr: float):
+def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: int):
     def update_fn(param, grad, state):
         m, v = state
-        param_update, m_new, v_new = adam_update(param, grad, m, v, lr)
+        param_update, m_new, v_new = adam_update(param, grad, m, v, lr, t)
         return param_update, (m_new, v_new)
     
     updated = jax.tree_map(update_fn, weights, grads, state)
@@ -562,7 +566,7 @@ def update_weights(weights: Weights, grads: Weights, state: Any, lr: float):
 def update_step(weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, opt_state: Any, step: int, cfg: Config):
     (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg)
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
-    weights, opt_state = update_weights(weights, grads, opt_state, lr)
+    weights, opt_state = update_weights(weights, grads, opt_state, lr, step)
     internals['grad_norms'] = jax.tree.map(jnp.linalg.norm, grads)
     internals['lr'] = lr
     return loss, weights, opt_state, internals
@@ -607,7 +611,7 @@ def prepare_chunk(chunk, pad_to: int, pad_id: int):
 def sample_next_token(logits, temperature=1.0, greedy: bool = True):
 
     if greedy:
-        return jnp.argmax(logits -1)
+        return jnp.argmax(logits, -1)
     else:
         # Apply temperature
         logits = logits / temperature
@@ -616,7 +620,7 @@ def sample_next_token(logits, temperature=1.0, greedy: bool = True):
         # Sample from the distribution
         return jax.random.categorical(jax.random.PRNGKey(0), probs, axis=-1)
 
-def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, batch_idx: int = 0, num_steps: int = 20):
+def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg: Config, batch_idx: int = 0, num_steps: int = 20, greedy: bool = True):
     """Samples from a prompt."""
 
     # Calculate the next power of 2 for padding, up to cfg.max_seq.
@@ -629,7 +633,7 @@ def sample_from_prompt(tokens: jax.Array, weights: Weights, cache: KVCache, cfg:
 
     tokens = []
     for _ in range(0, num_steps):
-        next_token = sample_next_token(next_token_logit)[None]
+        next_token = sample_next_token(next_token_logit, greedy=greedy)[None]
         tokens.append(next_token[0])
         prompt, prompt_segment_ids = prepare_chunk(next_token, pad_to=1, pad_id=0)
         logits, cache, _ = jax.jit(forward, static_argnames='cfg')(prompt, prompt_segment_ids, weights, cfg, cache)
