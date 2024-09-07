@@ -24,7 +24,7 @@ export PROJECT_ID=learning-from-play-303306
 
 export TPU_NAME=devbox1
 
-gcloud compute tpus tpu-vm create $TPU_NAME --zone $TPU_ZONE --accelerator-type=$TPU_SIZE --version=v2-alpha --project=$PROJECT_ID
+gcloud compute tpus tpu-vm create $TPU_NAME --zone $TPU_ZONE --accelerator-type=$TPU_SIZE --version=tpu-ubuntu2204-base --project=$PROJECT_ID
 
 
 gcloud compute tpus tpu-vm ssh $TPU_NAME --zone $TPU_ZONE --project $PROJECT_ID -- -L 8888:localhost:8888
