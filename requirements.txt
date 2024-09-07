@@ -10,3 +10,5 @@ tensorboard-plugin-profile
 tensorboard
 tensorboardX
 orbax
+Bio
+pillow

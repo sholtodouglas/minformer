@@ -1,17 +1,18 @@
 """Minimal model definition."""
 
-import functools
+from functools import partial
 import math
 import jax
 import jax.numpy as jnp
 from flax import struct
+from dataclasses import field
 from collections import namedtuple
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 from jax.experimental.pallas.ops.tpu import flash_attention
 import dataclasses
 import orbax.checkpoint as ocp
-from typing import Any
+from typing import Any, Callable
  
 
 def create_mesh():
@@ -76,125 +77,107 @@ class Config:
     warmup_steps: int = 50
     total_steps: int = 10000
 
-    
+
+@struct.dataclass
+class TensorInfo:
+    shape: jax.ShapeDtypeStruct
+    logical_axes: tuple
+    initializer: Callable | None = None
+    metadata: dict = field(default_factory=dict)
+
 
 @struct.dataclass
 class Layer:
-    q: jax.Array
-    k: jax.Array
-    v: jax.Array
-    proj: jax.Array
-    w1: jax.Array
-    w2: jax.Array
-    gamma1: jax.Array
-    gamma2: jax.Array
+    q: jax.Array | TensorInfo
+    k: jax.Array | TensorInfo
+    v: jax.Array | TensorInfo
+    proj: jax.Array | TensorInfo
+    w1: jax.Array | TensorInfo
+    w2: jax.Array | TensorInfo
+    gamma1: jax.Array | TensorInfo
+    gamma2: jax.Array | TensorInfo
 
     @classmethod
-    def shape(cls, cfg: Config):
+    def abstract(cls, cfg: Config):
         return Layer(
-            q=jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype),
-            k=jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
-            v=jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
-            proj=jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), cfg.weight_dtype),
-            w1=jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype),
-            w2=jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), cfg.weight_dtype),
-            gamma1=jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
-            gamma2=jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
-        )
-    
-    
-    @classmethod
-    def logical_axes(cls, cfg: Config):
-        del cfg
-        return Layer(
-            q=P('d_model', 'query_heads', 'key_dim'),
-            k=P('d_model', 'key_heads', 'key_dim'),
-            v=P('d_model', 'key_heads', 'key_dim'),
-            proj=P('query_heads', 'key_dim', 'd_model'),
-            w1=P('d_model', 'ffw'),
-            w2=P('ffw', 'd_model'),
-            gamma1=P('d_model'),
-            gamma2=P('d_model'),
-        )
-
-    @classmethod
-    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
-        return jax.tree.map(
-            lambda logical: _logical_to_sharding(logical, mesh, rules),
-            cls.logical_axes(cfg),
-        )
-
-
-
-    @classmethod
-    def init(cls, cfg: Config, key: jax.random.PRNGKey):
-        shape = cls.shape(cfg)
-        key, *subkeys = jax.random.split(key, 7)
-
-
-        return Layer(
-                q=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))(subkeys[0], shape.q.shape, dtype=cfg.weight_dtype),
-                k=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))(subkeys[1], shape.k.shape, dtype=cfg.weight_dtype),
-                v=jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))(subkeys[2], shape.v.shape, dtype=cfg.weight_dtype),
-                proj=jax.nn.initializers.he_normal(in_axis=(0,1), out_axis=2)(subkeys[3], shape.proj.shape, dtype=cfg.weight_dtype),
-                w1=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(subkeys[4], shape.w1.shape, dtype=cfg.weight_dtype),
-                w2=jax.nn.initializers.he_normal(in_axis=1, out_axis=0)(subkeys[5], shape.w2.shape, dtype=cfg.weight_dtype),
-                gamma1=jnp.ones(shape.gamma1.shape, dtype=cfg.weight_dtype),
-                gamma2=jnp.ones(shape.gamma2.shape, dtype=cfg.weight_dtype),
+            q=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype),
+                ('d_model', 'query_heads', 'key_dim'),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))
+            ),
+            k=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
+                ('d_model', 'key_heads', 'key_dim'),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))
+            ),
+            v=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
+                ('d_model', 'key_heads', 'key_dim'),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))
+            ),
+            proj=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), cfg.weight_dtype),
+                ('query_heads', 'key_dim', 'd_model'),
+                jax.nn.initializers.he_normal(in_axis=(0,1), out_axis=2)
+            ),
+            w1=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype),
+                ('d_model', 'ffw'),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
+            ),
+            w2=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), cfg.weight_dtype),
+                ('ffw', 'd_model'),
+                jax.nn.initializers.he_normal(in_axis=1, out_axis=0)
+            ),
+            gamma1=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
+                ('d_model',),
+                jax.nn.initializers.constant(1.0)
+            ),
+            gamma2=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
+                ('d_model',),
+                jax.nn.initializers.constant(1.0)
+            ),
         )
 
 @struct.dataclass
 class Weights:
     layers: list[Layer]
-    embedding: jax.Array  # New field for token embeddings
-    vocab_proj: jax.Array  # New field for final vocabulary projection
-
-
-    @classmethod
-    def shape(cls, cfg: Config):
-        return Weights(layers=[Layer.shape(cfg) for _ in range(cfg.num_layers)],
-            embedding=jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), jnp.float32),
-            vocab_proj=jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), jnp.float32))
+    embedding: jax.Array | TensorInfo
+    vocab_proj: jax.Array | TensorInfo
 
     @classmethod
-    def logical_axes(cls, cfg: Config):
+    def abstract(cls, cfg: Config):
         return Weights(
-            layers=[Layer.logical_axes(cfg) for _ in range(cfg.num_layers)],
-            embedding=P('vocab', 'd_model'),
-            vocab_proj=P('d_model', 'vocab')
-        )
-
-    @classmethod
-    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
-        logical_axes = cls.logical_axes(cfg)
-        return Weights(
-            layers=[Layer.shardings(cfg, mesh, rules) for _ in range(cfg.num_layers)],
-            embedding=_logical_to_sharding(logical_axes.embedding, mesh, rules),
-            vocab_proj=_logical_to_sharding(logical_axes.vocab_proj, mesh, rules),
-        )
-
-    @classmethod
-    def abstract(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
-        return jax.tree.map(
-            lambda shape, shd: jax.ShapeDtypeStruct(
-                shape.shape, shape.dtype, sharding=shd
+            layers=[Layer.abstract(cfg) for _ in range(cfg.num_layers)],
+            embedding=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), cfg.weight_dtype),
+                ('vocab', 'd_model'),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
             ),
-            Weights.shape(cfg),
-            Weights.shardings(cfg, mesh, rules)
+            vocab_proj=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype),
+                ('d_model', 'vocab'),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
+            )
         )
 
     @classmethod
-    def init(cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, rules: ShardingRules, use_low_mem_init: bool = False):
-        def _init():
-            shape = cls.shape(cfg)
-            keys = jax.random.split(key, cfg.num_layers + 2)  # +2 for embedding and vocab_proj
-            return Weights(layers=[Layer.init(cfg, keys[l]) for l in range(cfg.num_layers)],
-                embedding=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-2], shape.embedding.shape, dtype=cfg.weight_dtype),
-                vocab_proj=jax.nn.initializers.he_normal(in_axis=0, out_axis=1)(keys[-1], shape.vocab_proj.shape, dtype=cfg.weight_dtype)
-            )
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: dict):
+        abstract = cls.abstract(cfg)
+        return jax.tree.map(lambda info: _logical_to_sharding(info.logical_axes, mesh, rules), abstract, is_leaf=lambda x: isinstance(x, TensorInfo))
 
-        # This takes ~10-20s instead of 0.1s to init, but will init sharded. Use this when the
-        # weights would be too big for one device.
+    @classmethod
+    def init(cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, rules: dict, use_low_mem_init: bool = True):
+        def _init():
+            abstract = cls.abstract(cfg)
+            # Create one new RNG key per tensor.
+            num_leaves = len(jax.tree_util.tree_leaves(abstract))
+            key_iter = iter(jax.random.split(key, num_leaves))
+            return jax.tree.map(lambda info: info.initializer(next(key_iter), info.shape.shape, info.shape.dtype), abstract, is_leaf=lambda x: isinstance(x, TensorInfo))
+        
         if use_low_mem_init:
             _init = jax.jit(_init, out_shardings=cls.shardings(cfg, mesh, rules))
         return jax.device_put(_init(), cls.shardings(cfg, mesh, rules))
@@ -207,41 +190,34 @@ class KVCache:
     lengths: jax.Array  # [batch_size]
 
     @classmethod
-    def shape(cls, cfg: Config, batch_size: int, max_seq_len: int) -> 'KVCache':
+    def abstract(cls, cfg: Config, batch_size: int, max_seq_len: int):
         return KVCache(
-            k=[jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16) for _ in range(cfg.num_layers)],
-            v=[jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16) for _ in range(cfg.num_layers)],
-            lengths=jax.ShapeDtypeStruct((batch_size,), jnp.int32),
+            k=[TensorInfo(
+                jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16),
+                ('batch', 'key_heads', 'sequence', 'key_dim'),
+            ) for _ in range(cfg.num_layers)],
+            v=[TensorInfo(
+                jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16),
+                ('batch', 'key_heads', 'sequence', 'key_dim'),
+            ) for _ in range(cfg.num_layers)],
+            lengths=TensorInfo(
+                jax.ShapeDtypeStruct((batch_size,), jnp.int32),
+                ('batch',),
+            )
         )
 
     @classmethod
-    def logical_axes(cls, cfg: Config)  -> 'KVCache':
-        del cfg
-        return KVCache(
-            k=[P('batch', 'key_heads', 'sequence', 'key_dim') for _ in range(cfg.num_layers)],
-            v=[P('batch', 'key_heads', 'sequence', 'key_dim') for _ in range(cfg.num_layers)],
-            lengths=P('batch'),
-        )
+    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
+        abstract = cls.abstract(cfg, batch_size=1, max_seq_len=cfg.max_seq_len)  # Batch size 1, since we just want the axes names.
+        return jax.tree.map(lambda info: _logical_to_sharding(info.logical_axes, mesh, rules), abstract, is_leaf=lambda x: isinstance(x, TensorInfo))
 
     @classmethod
-    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules) -> 'KVCache':
-        return KVCache(
-            k=[_logical_to_sharding(logical, mesh, rules) for logical in cls.logical_axes(cfg).k],
-            v=[_logical_to_sharding(logical, mesh, rules) for logical in cls.logical_axes(cfg).v],
-            lengths=_logical_to_sharding(cls.logical_axes(cfg).lengths, mesh, rules),
-        )
-
-    @classmethod
-    def init(cls, cfg: Config, batch_size: int, max_seq_len: int) -> 'KVCache':
-        shape = cls.shape(cfg, batch_size, max_seq_len)
-        return KVCache(
-            k=[jnp.zeros(layer_shape.shape, layer_shape.dtype) for layer_shape in shape.k],
-            v=[jnp.zeros(layer_shape.shape, layer_shape.dtype) for layer_shape in shape.v],
-            lengths=jnp.zeros(shape.lengths.shape, shape.lengths.dtype),
-        )
+    def init(cls, cfg: Config, batch_size: int, max_seq_len: int):
+        abstract = cls.abstract(cfg, batch_size, max_seq_len)
+        return jax.tree.map(lambda info: jnp.zeros(info.shape.shape, info.shape.dtype), abstract, is_leaf=lambda x: isinstance(x, TensorInfo))
 
     @property
-    def time_axis(cls) -> int:
+    def time_axis(self) -> int:
         return 2
 
 def _generate_fixed_pos_embedding(
@@ -298,7 +274,7 @@ def slice_at(table, index, length):
     return jax.lax.dynamic_slice_in_dim(table, index, length)
 
 def slices_at(table, indices, length: int):
-    return jax.vmap(functools.partial(slice_at, length=length), in_axes=(None, 0))(table, indices)
+    return jax.vmap(partial(slice_at, length=length), in_axes=(None, 0))(table, indices)
 
 
 def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal: bool):
@@ -357,7 +333,7 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     # On TPUv3, pallas seems to only work with float32.
     q, k, v = jnp.float32(q), jnp.float32(k), jnp.float32(v)
     scale = (q.shape[-1] ** -0.5)
-    @functools.partial(shard_map,
+    @partial(shard_map,
               mesh=cfg.mesh,
                in_specs=(
                    _logical_to_physical(P('batch', 'query_heads', 'sequence', 'key_dim'), cfg.rules),
@@ -577,7 +553,7 @@ def input_shardings(mesh, rules) -> tuple[jax.sharding.NamedSharding, jax.shardi
         'segment_ids': P('batch', 'sequence'),
         'y': P('batch', 'sequence'),
     }
-    return jax.tree.map(functools.partial(_logical_to_sharding, mesh=mesh, rules=rules), logical_axes)
+    return jax.tree.map(partial(_logical_to_sharding, mesh=mesh, rules=rules), logical_axes)
 
 # Checkpointing logic
 def make_mgnr(path='/tmp/checkpoint_manager_sharded', erase: bool = False):
@@ -592,11 +568,23 @@ def save(mngr: ocp.CheckpointManager, weights: Weights, opt_state: Any, step: in
     mngr.wait_until_finished()
 
 def load(mngr: ocp.CheckpointManager, cfg: Config, step: int | None = None):
-    abstract_weights = Weights.abstract(cfg, cfg.mesh, cfg.rules)
-    abstract_opt_state = init_adam_state(abstract_weights)
+    abstract_weights = Weights.abstract(cfg)
+    weights_shapes_shardings = jax.tree.map(
+        lambda info: jax.ShapeDtypeStruct(
+            info.shape.shape,
+            info.shape.dtype,
+            sharding=jax.sharding.NamedSharding(
+                cfg.mesh,
+                _logical_to_physical(info.logical_axes, cfg.rules)
+            )
+        ),
+        abstract_weights,
+        is_leaf=lambda x: isinstance(x, TensorInfo)
+    )
+    opt_shapes_shardings = init_adam_state(weights_shapes_shardings)
     restored = mngr.restore(
         mngr.latest_step() if step is None else step,
-        args=ocp.args.StandardRestore({'weights': abstract_weights, 'opt_state': abstract_opt_state}),
+        args=ocp.args.StandardRestore({'weights': weights_shapes_shardings, 'opt_state': opt_shapes_shardings}),
     )
     return restored['weights'], restored['opt_state']
 
