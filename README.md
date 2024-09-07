@@ -56,7 +56,7 @@ pip3 install -r requirements.txt
 ```
 from jax.profiler import trace
 with trace("/tmp/profile"):
-    loss, weights, opt_state = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, 0)
+    loss, weights, opt_state, internals = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, 0)
     jax.block_until_ready(loss)
 ```
 
