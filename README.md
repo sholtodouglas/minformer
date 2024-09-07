@@ -61,7 +61,7 @@ with trace("/tmp/profile"):
 ```
 
 ```
-tensorboard --logdir=/tmp/profile
+python3 -m tensorboard.main --logdir=/tmp/profile
 ```
 
 ## Run training
