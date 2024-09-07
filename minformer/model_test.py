@@ -122,7 +122,8 @@ def test_attention_impl_equivalence():
         max_seq_len=1024,
         causal=True,
         use_attn_kernel=True,
-        weight_dtype=jnp.float32,
+        weight_dtype_at_rest=jnp.float32,
+        active_weight_dtype=jnp.float32,
         rules=rules,
         mesh=model.create_mesh()
     )
@@ -188,7 +189,8 @@ def test_incremental_prefill():
         max_seq_len=8192,
         causal=True,
         use_attn_kernel=False,
-        weight_dtype=jnp.float32,
+        weight_dtype_at_rest=jnp.float32,
+        active_weight_dtype=jnp.float32,
         rules=model.mdl_parallel_rules,
         mesh=model.create_mesh()
     )
@@ -245,7 +247,8 @@ def test_overtrain_and_sample_simple_sequence():
         max_seq_len=8192,
         causal=True,
         use_attn_kernel=True,
-        weight_dtype=jnp.float32,
+        weight_dtype_at_rest=jnp.float32,
+        active_weight_dtype=jnp.float32,
         rules=model.fsdp_rules,
         mesh=model.create_mesh(),
         max_lr=3e-4,
@@ -265,7 +268,8 @@ def test_overtrain_and_sample_simple_sequence():
         max_seq_len=8192,
         causal=True,
         use_attn_kernel=False,
-        weight_dtype=jnp.float32,
+        weight_dtype_at_rest=jnp.float32,
+        active_weight_dtype=jnp.float32,
         rules=model.mdl_parallel_rules,
         mesh=model.create_mesh()
     )

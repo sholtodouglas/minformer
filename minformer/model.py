@@ -67,7 +67,8 @@ class Config:
     max_seq_len: int
     causal: bool
     use_attn_kernel: bool
-    weight_dtype: jnp.float32
+    weight_dtype_at_rest: jnp.float32
+    active_weight_dtype: jnp.bfloat16
     # Sharding rules
     rules: ShardingRules
     mesh: jax.sharding.Mesh | None
@@ -101,42 +102,42 @@ class Layer:
     def abstract(cls, cfg: Config):
         return Layer(
             q=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype_at_rest),
                 ('d_model', 'query_heads', 'key_dim'),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))
             ),
             k=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype_at_rest),
                 ('d_model', 'key_heads', 'key_dim'),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))
             ),
             v=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.key_heads, cfg.key_dim), cfg.weight_dtype_at_rest),
                 ('d_model', 'key_heads', 'key_dim'),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=(1,2))
             ),
             proj=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), cfg.weight_dtype_at_rest),
                 ('query_heads', 'key_dim', 'd_model'),
                 jax.nn.initializers.he_normal(in_axis=(0,1), out_axis=2)
             ),
             w1=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype_at_rest),
                 ('d_model', 'ffw'),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
             ),
             w2=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), cfg.weight_dtype_at_rest),
                 ('ffw', 'd_model'),
                 jax.nn.initializers.he_normal(in_axis=1, out_axis=0)
             ),
             gamma1=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ('d_model',),
                 jax.nn.initializers.constant(1.0)
             ),
             gamma2=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ('d_model',),
                 jax.nn.initializers.constant(1.0)
             ),
@@ -153,12 +154,12 @@ class Weights:
         return Weights(
             layers=[Layer.abstract(cfg) for _ in range(cfg.num_layers)],
             embedding=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), cfg.weight_dtype_at_rest),
                 ('vocab', 'd_model'),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
             ),
             vocab_proj=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype),
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype_at_rest),
                 ('d_model', 'vocab'),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1)
             )
@@ -318,8 +319,6 @@ def attention(q: jax.Array, k: jax.Array, v: jax.Array, q_segment_ids: jax.Array
     qk = jnp.einsum('bhtd,bhTd->bhtT', q, k) * scale
     mask = make_attention_mask(q.shape[2], k.shape[2], q_segment_ids, k_segment_ids, q_offset, cfg.causal)
     # Apply the combined mask
-
-    max_score = jnp.max(qk, axis=-1, keepdims=True)
     qk = jnp.where(mask, qk, -1e30)
     # Jax softmax impl includes max subtraction for numerical stability, no need to
     # do it outside.
@@ -358,7 +357,7 @@ def forward_layer(x: jax.Array, segment_ids: jax.Array, layer: Layer, sin: jax.A
     # First RMSNorm (Pre-LN for attention)
 
     # Cast layer to bfloat16 for faster operations.
-    # layer = jax.tree.map(lambda x: jnp.bfloat16(x), layer)
+    layer = jax.tree.map(lambda x: cfg.active_weight_dtype(x), layer)
     with jax.named_scope('attn_pre_norm'):
         attn_in = rms_norm(x, layer.gamma1)
     
