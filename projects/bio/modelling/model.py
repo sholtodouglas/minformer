@@ -532,6 +532,8 @@ def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: i
     def update_fn(param, grad, state, grad_norm):
         m, v = state
         # Clip and rescale gradients when they exceed a specified value, useful for training instabilities.
+        # This clips per parameter - rather than globally, but that lets us overlap weights sync on the bwd pass.
+        # Bit hacky? TBD if needed.
         scale_factor = jnp.maximum(grad_norm, cfg.grad_norm_clip)
         grad = grad / scale_factor.astype(grad.dtype) * cfg.grad_norm_clip
         param_update, m_new, v_new = adam_update(param, grad, m, v, lr, t)

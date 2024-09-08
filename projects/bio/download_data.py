@@ -1,6 +1,22 @@
+"""Downloads data for charformer.
+
+
+python3 projects/bio/download_data.py
+
+python3 projects/bio/download_data.py --use_gcs --bucket_name minformer_data --gcs_output_dir bio/human_genome_8192/tfrecords/
+"""
+
 import os
 import urllib.request
 import data
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Download and process DNA data")
+    parser.add_argument("--use_gcs", action="store_true", help="Use Google Cloud Storage")
+    parser.add_argument("--bucket_name", type=str, help="GCS bucket name")
+    parser.add_argument("--gcs_output_dir", type=str, default="dna_data/tfrecords/", help="GCS output directory")
+    return parser.parse_args()
 
 def download_file(url, filename):
     """Download a file if it doesn't exist."""
@@ -12,6 +28,7 @@ def download_file(url, filename):
         print(f"{filename} already exists. Skipping download.")
 
 def main():
+    args = parse_args()
     # Get the directory of the current script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
@@ -25,17 +42,23 @@ def main():
     download_file(url, input_file_path)
 
     ds = data.DNADataset(sequence_length=8192)
+
+    # Set up output directory
+    if args.use_gcs:
+        output_dir = f"gs://{args.bucket_name}/{args.gcs_output_dir}"
+        print(f"Creating packed records in GCS bucket {args.bucket_name} at {output_dir}...")
+    else:
+        output_dir = os.path.join(data_dir, 'tfrecords/')
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Creating packed records at {output_dir}...")
+
     # Create packed records
-    output_dir = os.path.join(data_dir, 'tfrecords/')
-    os.makedirs(output_dir, exist_ok=True)
     print(f"Creating packed records at {output_dir}...")
     ds.create_tfrecords(
         input_file_path=input_file_path,
         output_dir=output_dir,
     )
     print("Packed records created successfully.")
-
-
 
 if __name__ == "__main__":
     main()
