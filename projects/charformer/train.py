@@ -1,4 +1,8 @@
-"""Script for running training with TensorBoard logging, configurable parameters, and configuration tracking."""
+"""Script for running training with TensorBoard logging, configurable parameters, and configuration tracking.
+
+python3 projects/charformer/train.py --checkpoint_dir=/tmp/charformer_checkpoints/test_run --checkpoint_interval=1000
+
+"""
 import sys
 from typing import Any
 sys.path.append('../minformer')
@@ -31,7 +35,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Eval step every N steps")
-    parser.add_argument("--data_dir", type=str, default='data/tfrecords/', help="Directory containing TFRecord files")
+    parser.add_argument("--data_dir", type=str, default='gs://minformer_data/charformer/tiny_stories/tfrecords/', help="Directory containing TFRecord files. Local option: data/tfrecords/")
     parser.add_argument("--log_dir", type=str, default="/tmp/logs/charformer_training", help="Base directory for TensorBoard logs")
     parser.add_argument("--log_weight_histograms", default=False, action="store_true", help="Enable logging of weight histograms")
     parser.add_argument("--checkpoint_dir", type=str, default="/tmp/charformer_checkpoints", help="Directory for saving checkpoints")
@@ -84,8 +88,14 @@ def main():
     # Data setup
     ds = data.CharDataset(data.CharDataset.get_default_config())
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(script_dir, args.data_dir)
+    if "gs://" in args.data_dir:
+        # Use absolute remote path.
+        data_dir = args.data_dir
+    else:
+        # Use local relative path.
+        data_dir = os.path.join(script_dir, args.data_dir)
     iter = ds.create_iterator(str(data_dir) + 'record_*.tfrecord', batch_size=args.batch_size)
+    print(f"Loading data from {data_dir}")
 
     # Model configuration
     cfg = model.Config(

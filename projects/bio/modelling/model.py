@@ -77,6 +77,8 @@ class Config:
     min_lr: float = 1e-5
     warmup_steps: int = 50
     total_steps: int = 10000
+    # Rescale gradients which spike.
+    grad_norm_clip: float = 0.1
 
 
 @struct.dataclass
@@ -526,23 +528,26 @@ def compute_loss(weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.
     internals['accuracy'] = accuracy
     return loss, internals
 
-def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: int):
-    def update_fn(param, grad, state):
+def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: int, cfg: Config, internals: Any):
+    def update_fn(param, grad, state, grad_norm):
         m, v = state
+        # Clip and rescale gradients when they exceed a specified value, useful for training instabilities.
+        scale_factor = jnp.maximum(grad_norm, cfg.grad_norm_clip)
+        grad = grad / scale_factor.astype(grad.dtype) * cfg.grad_norm_clip
         param_update, m_new, v_new = adam_update(param, grad, m, v, lr, t)
         return param_update, (m_new, v_new)
-    
-    updated = jax.tree_map(update_fn, weights, grads, state)
+    grad_norms = jax.tree.map(jnp.linalg.norm, grads)
+    internals['grad_norms'] = grad_norms
+    updated = jax.tree_map(update_fn, weights, grads, state, grad_norms)
     # Use weights for it's tree prefix.
     new_weights = jax.tree.map(lambda _, u: u[0], weights, updated)
     new_state = jax.tree.map(lambda _, u: u[1], weights, updated)
-    return new_weights, new_state
+    return new_weights, new_state, internals
 
 def update_step(weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, opt_state: Any, step: int, cfg: Config):
     (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg)
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
-    weights, opt_state = update_weights(weights, grads, opt_state, lr, step)
-    internals['grad_norms'] = jax.tree.map(jnp.linalg.norm, grads)
+    weights, opt_state, internals = update_weights(weights, grads, opt_state, lr, step, cfg, internals)
     internals['lr'] = lr
     return loss, weights, opt_state, internals
 
