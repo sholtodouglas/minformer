@@ -70,5 +70,5 @@ python3 -m tensorboard.main --logdir=/tmp/profile
 python3 projects/charformer/train.py --checkpoint_dir=/tmp/charformer_checkpoints/test_run --checkpoint_interval=1000
 
 python3 projects/charformer/train.py --checkpoint_dir=/tmp/charformer_checkpoints/test_run --checkpoint_interval=1000 --resume_from_checkpoint
-tensorboard --logdir=/tmp/logs
+python3 -m tensorboard.main --logdir=/tmp/logs
 ```
