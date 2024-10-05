@@ -1,0 +1,38 @@
+[tool.poetry]
+name = "minformer"
+version = "0.1.0"
+description = ""
+authors = ["Sholto Douglas", "Tristan Frizza <tfrizza@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+jax = {version = "*", extras = ["tpu"], optional = true}
+tensorflow = "*"
+flax = "*"
+tqdm = "*"
+numpy = "*"
+ipywidgets = "*"
+tensorboard-plugin-profile = "*"
+tensorboard = "*"
+tensorboardX = "*"
+orbax = "*"
+
+[tool.poetry.extras]
+tpu = ["jax"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 120
+
+[tool.ruff]
+line-length = 120
+
+[tool.poetry.scripts]
+format = "poetry run black ."
+lint = "poetry run ruff check ."
+lint-fix = "poetry run ruff check --fix ."
+format-and-lint = "poetry run black . && poetry run ruff check --fix ."

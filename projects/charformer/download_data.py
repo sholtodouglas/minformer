@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--gcs_output_dir", type=str, default="charformer/tiny_stories/tfrecords/", help="GCS output directory")
     return parser.parse_args()
 
+
 def download_file(url, filename):
     """Download a file if it doesn't exist."""
     if not os.path.exists(filename):
@@ -27,18 +28,19 @@ def download_file(url, filename):
     else:
         print(f"{filename} already exists. Skipping download.")
 
+
 def main():
     args = parse_args()
     # Get the directory of the current script
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     # Create a 'data' directory in the same location as the script
-    data_dir = os.path.join(script_dir, 'data')
+    data_dir = os.path.join(script_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
 
     # Download the dataset
     url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt"
-    input_file_path = os.path.join(data_dir, 'TinyStoriesV2-GPT4-train.txt')
+    input_file_path = os.path.join(data_dir, "TinyStoriesV2-GPT4-train.txt")
     download_file(url, input_file_path)
 
     # Create CharDataset instance
@@ -57,9 +59,10 @@ def main():
     ds.create_packed_records(
         input_file_path=input_file_path,
         output_dir=output_dir,
-        custom_delimiter='<|endoftext|>'
+        custom_delimiter="<|endoftext|>",
     )
     print("Packed records created successfully.")
+
 
 if __name__ == "__main__":
     main()
