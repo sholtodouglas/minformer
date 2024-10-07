@@ -1,16 +1,17 @@
 import os
 import re
-
+from typing import Any
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
+
 
 VOCAB = ["P", "S", "E", "U", "A", "C", "G", "T"]  #  padding, start, end, unknown, A, C, G, T
 VOCAB_SIZE = len(VOCAB)
 stoi = {ch: i for i, ch in enumerate(VOCAB)}
 itos = {i: ch for i, ch in enumerate(VOCAB)}
-encode = lambda x: [stoi.get(ch, 0) for ch in x]
-decode = lambda x: "".join([itos.get(i, "U") for i in x])
+tokenize = lambda x: [stoi.get(ch, 0) for ch in x]
+detokenize = lambda x: "".join([itos.get(i, "U") for i in x])
 
 
 def preprocess_dna_sequence(x, sequence_length):
@@ -21,7 +22,7 @@ def preprocess_dna_sequence(x, sequence_length):
     return ['S' + x[i : i + start_end_adjusted_seqlen] + 'E' for i in range(0, len(x), start_end_adjusted_seqlen)]
 
 
-def process_and_save_tfrecords(dataset, output_dir, sequence_length=8192):
+def process_and_save_tfrecords(dataset, output_dir, sequence_length):
     os.makedirs(output_dir, exist_ok=True)
     current_tokens = []
     current_segment_ids = []
@@ -33,8 +34,7 @@ def process_and_save_tfrecords(dataset, output_dir, sequence_length=8192):
         chunks = preprocess_dna_sequence(sequence, sequence_length)
 
         for chunk_idx, chunk in enumerate(chunks):
-            tokens = encode(chunk)
-
+            tokens = tokenize(chunk)
             if len(current_tokens) + len(tokens) <= sequence_length:
                 current_tokens.extend(tokens)
                 current_segment_ids.extend([sequence_number] * len(tokens))
@@ -44,11 +44,11 @@ def process_and_save_tfrecords(dataset, output_dir, sequence_length=8192):
                 if len(current_tokens) > 0:
                     save_record(output_dir, record_count, current_tokens, current_segment_ids, sequence_length)
                     record_count += 1
+                    sequence_number = 1
 
                 # Start a new sequence
                 current_tokens = tokens
                 current_segment_ids = [sequence_number] * len(tokens)
-                sequence_number += 1
 
             # Check if we have a full sequence to save so we can save immediately
             if len(current_tokens) == sequence_length:
@@ -85,3 +85,39 @@ def save_record(output_dir, record_count, tokens, segment_ids, sequence_length):
     output_file = os.path.join(output_dir, f"record_{record_count}.tfrecord")
     with tf.io.TFRecordWriter(output_file) as writer:
         save_tfrecord(writer, tokens, segment_ids)
+
+
+def feature_description() -> Any:
+    return {
+        "x": tf.io.FixedLenSequenceFeature([], tf.int64, allow_missing=True),
+        "segment_ids": tf.io.FixedLenSequenceFeature([], tf.int64, allow_missing=True),
+    }
+
+
+def load_and_retokenize_tfrecord(file_path: str) -> list[str]:
+    """
+    Loads a TFRecord file and retokenizes its content according to the current DNADataset instance.
+
+    Args:
+    file_path (str): Path to the TFRecord file.
+
+    Returns:
+    List[str]: A list of retokenized DNA sequences.
+    """
+    retokenized_data = []
+    segment_ids = []
+
+    def _parse_function(example_proto):
+        return tf.io.parse_single_example(example_proto, feature_description())
+
+    dataset = tf.data.TFRecordDataset(file_path)
+    parsed_dataset = dataset.map(_parse_function)
+
+    for parsed_record in parsed_dataset:
+        x = parsed_record["x"].numpy()
+        seg_ids = parsed_record["segment_ids"].numpy()
+        original_sequence = detokenize(x)
+        retokenized_data.append(original_sequence)
+        segment_ids.append(seg_ids)
+
+    return retokenized_data, segment_ids

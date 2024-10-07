@@ -283,7 +283,7 @@ def segment_ids_to_positions(segment_ids):
 
 
 def _generate_pos_embeddings(
-    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16000.0
+    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16384.0
 ) -> tuple[jax.Array, jax.Array]:
     """Generate Sin/Cos for Rotary Embeddings.
 
