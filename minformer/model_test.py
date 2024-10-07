@@ -316,8 +316,8 @@ def test_overtrain_and_sample_simple_sequence():
 
 # Run the test
 if __name__ == "__main__":
-    test_make_attention_mask()
-    test_attention_impl_equivalence()
-    test_cross_entropy_loss()
-    test_incremental_prefill()
+    # test_make_attention_mask()
+    # test_attention_impl_equivalence()
+    # test_cross_entropy_loss()
+    # test_incremental_prefill()
     test_overtrain_and_sample_simple_sequence()
