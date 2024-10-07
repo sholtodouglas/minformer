@@ -245,8 +245,9 @@ def _generate_pos_embeddings(
 
   The outputs are computed as:
 
-    output_sin[i, j] = sin(i / timescale[j])
-    output_cos[i, j] = cos(i / timescale[j])
+
+    sin[b, t, j] = sin(rope_pos[b, t] / timescale[j])
+    cos[b, t, j] = cos(rope_pos[b, t] / timescale[j])
 
   Args:
     postions: [batch, time]
