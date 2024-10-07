@@ -3,20 +3,25 @@
 python3 projects/charformer/train.py --checkpoint_dir=/tmp/charformer_checkpoints/test_run --checkpoint_interval=100000
 
 """
+
 import sys
 from typing import Any
-sys.path.append('../minformer')
 
+sys.path.append("../minformer")
+
+import argparse
+import functools
+import os
+from datetime import datetime
+
+import data as data
 import jax
 import jax.numpy as jnp
-import os
-import functools
-import argparse
-from tensorboardX import SummaryWriter
-import data as data
 import utils as charformer_utils
+from tensorboardX import SummaryWriter
+
 import minformer.model as model
-from datetime import datetime
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Charformer Training Script")
@@ -35,47 +40,71 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Eval step every N steps")
-    parser.add_argument("--data_dir", type=str, default='gs://minformer_data/charformer/tiny_stories/tfrecords/', help="Directory containing TFRecord files. Local option: data/tfrecords/")
-    parser.add_argument("--log_dir", type=str, default="/tmp/logs/charformer_training", help="Base directory for TensorBoard logs")
-    parser.add_argument("--log_weight_histograms", default=False, action="store_true", help="Enable logging of weight histograms")
-    parser.add_argument("--checkpoint_dir", type=str, default="/tmp/charformer_checkpoints", help="Directory for saving checkpoints")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="gs://minformer_data/charformer/tiny_stories/tfrecords/",
+        help="Directory containing TFRecord files. Local option: data/tfrecords/",
+    )
+    parser.add_argument(
+        "--log_dir", type=str, default="/tmp/logs/charformer_training", help="Base directory for TensorBoard logs"
+    )
+    parser.add_argument(
+        "--log_weight_histograms", default=False, action="store_true", help="Enable logging of weight histograms"
+    )
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default="/tmp/charformer_checkpoints", help="Directory for saving checkpoints"
+    )
     parser.add_argument("--checkpoint_interval", type=int, default=-1, help="Save checkpoint every N steps")
-    parser.add_argument("--resume_from_checkpoint", action="store_true", help="Resume training from the latest checkpoint")
+    parser.add_argument(
+        "--resume_from_checkpoint", action="store_true", help="Resume training from the latest checkpoint"
+    )
     return parser.parse_args()
+
 
 def clean_key(key):
     cleaned = key.replace("['", "").replace("']", "")
     cleaned = cleaned.replace(".", "/")
     return cleaned
 
+
 def flatten_pytree(tree):
-    leaves = jax.tree_util.tree_map_with_path(
-        lambda p, x: (clean_key(jax.tree_util.keystr(p)), x),
-        tree
-    )
+    leaves = jax.tree_util.tree_map_with_path(lambda p, x: (clean_key(jax.tree_util.keystr(p)), x), tree)
     return jax.tree_util.tree_leaves(leaves, is_leaf=lambda x: isinstance(x, tuple))
+
 
 def log_metrics(writer, metrics, step):
     flat_metrics = flatten_pytree(metrics)
-    for (key, value) in flat_metrics:
+    for key, value in flat_metrics:
         if isinstance(value, (int, float, jnp.number)):
             writer.add_scalar(key, value, step)
         elif isinstance(value, jnp.ndarray) and value.size == 1:
             writer.add_scalar(key, value.item(), step)
 
+
 def log_weight_histograms(writer, weights, step):
-    flat_weights = flatten_pytree({'weights': weights})
+    flat_weights = flatten_pytree({"weights": weights})
     for key, value in flat_weights:
         if isinstance(value, jnp.ndarray):
             writer.add_histogram(key, value, step)
 
-def eval_batch(batch: Any, dataset: data.CharDataset, weights: model.Weights, writer: SummaryWriter, step: int, cfg: model.Config, batch_row: int = 0):
-    _, internals = model.compute_loss(weights, batch['x'], batch['segment_ids'], batch['y'], cfg)
-    losses = internals['per_token_loss']
-    length = jnp.sum(batch['segment_ids'][batch_row] != 0) - 1
-    text = dataset.detokenize(batch['y'][batch_row, :length])
+
+def eval_batch(
+    batch: Any,
+    dataset: data.CharDataset,
+    weights: model.Weights,
+    writer: SummaryWriter,
+    step: int,
+    cfg: model.Config,
+    batch_row: int = 0,
+):
+    _, internals = model.compute_loss(weights, batch["x"], batch["segment_ids"], batch["y"], cfg)
+    losses = internals["per_token_loss"]
+    length = jnp.sum(batch["segment_ids"][batch_row] != 0) - 1
+    text = dataset.detokenize(batch["y"][batch_row, :length])
     losses = losses[batch_row, :length]
     charformer_utils.visualize_token_prediction_difficulty(text, losses, save_image=True, writer=writer, step=step)
+
 
 def main():
     args = parse_args()
@@ -94,7 +123,7 @@ def main():
     else:
         # Use local relative path.
         data_dir = os.path.join(script_dir, args.data_dir)
-    iter = ds.create_iterator(str(data_dir) + 'record_*.tfrecord', batch_size=args.batch_size)
+    iter = ds.create_iterator(str(data_dir) + "record_*.tfrecord", batch_size=args.batch_size)
     print(f"Loading data from {data_dir}")
 
     # Model configuration
@@ -138,26 +167,28 @@ def main():
         start_step = 0
         print("Initialization done.")
 
-
     # JIT-compile the update step
-    step = jax.jit(model.update_step, static_argnames='cfg')
+    step = jax.jit(model.update_step, static_argnames="cfg")
     step = functools.partial(step, cfg=cfg)
 
     # Training loop
     with SummaryWriter(log_dir) as writer:
         # Log hyperparameters
-        writer.add_hparams({
-            'd_model': cfg.d_model,
-            'num_layers': cfg.num_layers,
-            'query_heads': cfg.query_heads,
-            'key_heads': cfg.key_heads,
-            'max_lr': cfg.max_lr,
-            'min_lr': cfg.min_lr,
-            'warmup_steps': cfg.warmup_steps,
-            'total_steps': cfg.total_steps,
-            'batch_size': args.batch_size,
-            'max_seq_len': cfg.max_seq_len,
-        }, {})
+        writer.add_hparams(
+            {
+                "d_model": cfg.d_model,
+                "num_layers": cfg.num_layers,
+                "query_heads": cfg.query_heads,
+                "key_heads": cfg.key_heads,
+                "max_lr": cfg.max_lr,
+                "min_lr": cfg.min_lr,
+                "warmup_steps": cfg.warmup_steps,
+                "total_steps": cfg.total_steps,
+                "batch_size": args.batch_size,
+                "max_seq_len": cfg.max_seq_len,
+            },
+            {},
+        )
 
         # TODO(sholto): If we want identical restart from mid training we need to step the
         # iterator or get a read pointer-able dataset.
@@ -167,18 +198,20 @@ def main():
             if i % args.eval_every == 0:
                 eval_batch(batch, ds, weights, writer, i, cfg)
 
-            loss, weights, opt_state, internals = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, i)
-            
+            loss, weights, opt_state, internals = step(
+                weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
+            )
+
             if i % args.log_every == 0:
                 # Log loss to TensorBoard
-                writer.add_scalar('loss', loss, i)
+                writer.add_scalar("loss", loss, i)
                 print(f"Step {i}, Loss: {loss}")
                 log_metrics(writer, internals, i)
 
                 # Log weight histograms if enabled
                 if args.log_weight_histograms:
                     log_weight_histograms(writer, weights, i)
-            
+
             # Save checkpoint
             if i % args.checkpoint_interval == 0 and args.checkpoint_interval != -1:
                 print(f"Saving checkpoint at step {i}")
@@ -187,6 +220,7 @@ def main():
             # Optional: Add code here to save checkpoints periodically
 
     print("Training completed. TensorBoard logs saved in:", log_dir)
+
 
 if __name__ == "__main__":
     main()
