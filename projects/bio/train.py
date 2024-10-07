@@ -1,3 +1,11 @@
+"""
+
+
+For open genome:
+
+python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train/ --log_every=1
+
+"""
 import argparse
 import functools
 import os
@@ -10,8 +18,8 @@ import jax
 import jax.numpy as jnp
 import modelling.model as model
 import numpy as np
-import utils as bio_utils
 from tensorboardX import SummaryWriter
+import data_hf
 
 
 def parse_args():
@@ -23,7 +31,7 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=16, help="Number of layers")
     parser.add_argument("--key_dim", type=int, default=128, help="Key dimension")
     parser.add_argument("--vocab_size", type=int, default=8, help="Vocabulary size")
-    parser.add_argument("--max_seq_len", type=int, default=8192, help="Maximum sequence length")
+    parser.add_argument("--max_seq_len", type=int, default=16384, help="Maximum sequence length")
     parser.add_argument("--max_lr", type=float, default=3e-4, help="Maximum learning rate")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="Number of warmup steps")
@@ -75,23 +83,6 @@ def log_metrics(writer, metrics, step):
             writer.add_scalar(key, value.item(), step)
 
 
-def eval_batch(
-    batch: Any,
-    dataset: data.DNADataset,
-    weights: model.Weights,
-    writer: SummaryWriter,
-    step: int,
-    cfg: model.Config,
-    batch_row: int = 0,
-):
-    _, internals = model.compute_loss(weights, batch["x"], batch["segment_ids"], batch["y"], cfg)
-    losses = internals["per_token_loss"]
-    length = jnp.sum(batch["segment_ids"][batch_row] != 0) - 1
-    sequence = dataset.detokenize(batch["y"][batch_row, :length])
-    losses = losses[batch_row, :length]
-    bio_utils.visualize_token_prediction_difficulty(sequence, losses, save_image=True, writer=writer, step=step)
-
-
 def main():
     args = parse_args()
 
@@ -101,10 +92,8 @@ def main():
     log_dir = os.path.join(args.log_dir, log_dir_name)
 
     # Data setup
-    ds = data.DNADataset(sequence_length=args.max_seq_len)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(script_dir, args.data_dir)
-    iter = ds.create_iterator(str(data_dir) + "record_*.tfrecord", batch_size=args.batch_size)
+    # TODO: Configure.
+    iter = data_hf.create_iterator(str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True)
 
     # Model configuration
     cfg = model.Config(
@@ -174,9 +163,6 @@ def main():
             batch = process_batch(next(iter))
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
-            # if i % args.eval_every == 0:
-            #     eval_batch(batch, ds, weights, writer, i, cfg)
-
             loss, weights, opt_state, internals = step(
                 weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
             )
@@ -189,7 +175,7 @@ def main():
                 log_metrics(writer, internals, i)
 
             # Save checkpoint
-            if i % args.checkpoint_interval == 0:
+            if i % args.checkpoint_interval == 0 and i > 0:
                 print(f"Saving checkpoint at step {i}")
                 model.save(ckpt_manager, weights, opt_state, i)
 

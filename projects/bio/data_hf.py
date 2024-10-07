@@ -121,3 +121,24 @@ def load_and_retokenize_tfrecord(file_path: str) -> list[str]:
         segment_ids.append(seg_ids)
 
     return retokenized_data, segment_ids
+
+def create_iterator(file_pattern: str, batch_size: int, shuffle: bool = False):
+    """Creates a python iterator to load batches."""
+
+    def _parse_function(example_proto):
+        parsed_features = tf.io.parse_single_example(example_proto, feature_description())
+        return parsed_features
+
+    files = tf.data.Dataset.list_files(file_pattern)
+    dataset = tf.data.TFRecordDataset(files)
+    dataset = dataset.map(_parse_function, num_parallel_calls=tf.data.AUTOTUNE)
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=1000)
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+
+    for batch in dataset:
+        yield {
+            "x": batch["x"].numpy().astype(np.int32),
+            "segment_ids": batch["segment_ids"].numpy().astype(np.int32),
+        }

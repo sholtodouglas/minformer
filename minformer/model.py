@@ -13,14 +13,16 @@ import orbax.checkpoint as ocp
 from flax import struct
 from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
+from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
 
 
 def create_mesh():
     """Always 1D because only care about FSDP."""
     devices = jax.devices()
+    mesh_shape = (len(devices),)
     # Create a 1D mesh with all devices along the 'x' axis
-    mesh = jax.sharding.Mesh(devices, ("x",))
+    mesh = jax.sharding.Mesh(mesh_utils.create_device_mesh(mesh_shape, devices), ("x",))
     return mesh
 
 
