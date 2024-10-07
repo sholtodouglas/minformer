@@ -9,16 +9,18 @@ from typing import Any
 
 sys.path.append("../minformer")
 
+import argparse
+import functools
+import os
+from datetime import datetime
+
+import data as data
 import jax
 import jax.numpy as jnp
-import os
-import functools
-import argparse
-from tensorboardX import SummaryWriter
-import data as data
 import utils as charformer_utils
+from tensorboardX import SummaryWriter
+
 import minformer.model as model
-from datetime import datetime
 
 
 def parse_args():

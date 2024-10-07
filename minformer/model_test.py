@@ -1,8 +1,9 @@
 import functools
+
 import jax
 import jax.numpy as jnp
-import numpy as np
 import model
+import numpy as np
 
 
 def print_test_passed(test_name):

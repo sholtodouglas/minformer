@@ -1,5 +1,6 @@
-import jax
 from collections import namedtuple
+
+import jax
 from jax.sharding import PartitionSpec as P
 
 

@@ -4,13 +4,13 @@ Reccomended dataset:
 wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
 """
 
-import numpy as np
-from typing import Dict, List, Tuple
-import tensorflow as tf
 import os
 import string
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import tensorflow as tf
 import tqdm
-from typing import Any
 
 
 class CharDataset:
@@ -39,13 +39,9 @@ class CharDataset:
             "à",
             "´",
         ]
-        self.stoi: Dict[str, int] = {
-            ch: i + 1 for i, ch in enumerate(self.chars)
-        }  # Start from 1
+        self.stoi: Dict[str, int] = {ch: i + 1 for i, ch in enumerate(self.chars)}  # Start from 1
         self.stoi["<unk>"] = 0  # Add unknown token with id 0
-        self.itos: Dict[int, str] = {
-            i + 1: ch for i, ch in enumerate(self.chars)
-        }  # Start from 1
+        self.itos: Dict[int, str] = {i + 1: ch for i, ch in enumerate(self.chars)}  # Start from 1
         self.itos[0] = "<unk>"  # Add unknown token with id 0
 
     @property
@@ -76,14 +72,10 @@ class CharDataset:
         return {
             "x": tf.io.FixedLenSequenceFeature([], tf.int64, allow_missing=True),
             "y": tf.io.FixedLenSequenceFeature([], tf.int64, allow_missing=True),
-            "segment_ids": tf.io.FixedLenSequenceFeature(
-                [], tf.int64, allow_missing=True
-            ),
+            "segment_ids": tf.io.FixedLenSequenceFeature([], tf.int64, allow_missing=True),
         }
 
-    def create_packed_records(
-        self, input_file_path: str, output_dir: str, custom_delimiter: str
-    ):
+    def create_packed_records(self, input_file_path: str, output_dir: str, custom_delimiter: str):
         """Takes a (potentially large) file, and saves it into tf records."""
 
         files_saved_so_far = 0
@@ -104,9 +96,7 @@ class CharDataset:
                     feature={
                         "x": tf.train.Feature(int64_list=tf.train.Int64List(value=x)),
                         "y": tf.train.Feature(int64_list=tf.train.Int64List(value=y)),
-                        "segment_ids": tf.train.Feature(
-                            int64_list=tf.train.Int64List(value=segment_ids)
-                        ),
+                        "segment_ids": tf.train.Feature(int64_list=tf.train.Int64List(value=segment_ids)),
                     }
                 )
             )
@@ -139,29 +129,21 @@ class CharDataset:
                         if len(tokens) > self.sequence_length:
                             token_span = tokens[: self.sequence_length + 1]
                             segment_ids = np.ones_like(token_span)
-                        new_output_file = (
-                            output_dir + f"record_{files_saved_so_far}.tfrecord"
-                        )
+                        new_output_file = output_dir + f"record_{files_saved_so_far}.tfrecord"
                         # print("".join([self.itos[int(t)] for t in token_span[:]])+"\n\n ------- \n\n")
                         # print(segment_ids[:2048])
                         with tf.io.TFRecordWriter(new_output_file) as writer:
                             save_tfrecord(writer, token_span, segment_ids)
                         # And reset everything.
-                        token_span = np.zeros(
-                            (self.sequence_length + 1), dtype=np.int32
-                        )
-                        segment_ids = np.zeros(
-                            (self.sequence_length + 1), dtype=np.int32
-                        )
+                        token_span = np.zeros((self.sequence_length + 1), dtype=np.int32)
+                        segment_ids = np.zeros((self.sequence_length + 1), dtype=np.int32)
                         tokens_so_far = 0
                         segments_so_far = 1
                         files_saved_so_far += 1
                 else:
                     current_text += line
 
-    def load_and_retokenize_tfrecord(
-        self, file_path: str
-    ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    def load_and_retokenize_tfrecord(self, file_path: str) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
         Loads a TFRecord file and retokenizes its content according to the current CharDataset instance.
 
@@ -195,15 +177,11 @@ class CharDataset:
 
         return retokenized_data
 
-    def create_iterator(
-        self, file_pattern: str, batch_size: int, shuffle: bool = False
-    ):
+    def create_iterator(self, file_pattern: str, batch_size: int, shuffle: bool = False):
         """Creates a python iterator to load batches."""
 
         def _parse_function(example_proto):
-            parsed_features = tf.io.parse_single_example(
-                example_proto, self.feature_description
-            )
+            parsed_features = tf.io.parse_single_example(example_proto, self.feature_description)
             return parsed_features
 
         files = tf.data.Dataset.list_files(file_pattern)

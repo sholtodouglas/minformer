@@ -1,18 +1,19 @@
 """Minimal model definition."""
 
-from functools import partial
+import dataclasses
 import math
+from dataclasses import field
+from functools import partial
+from typing import Any, Callable
+
 import jax
 import jax.numpy as jnp
-from flax import struct
-from dataclasses import field
-from jax.sharding import PartitionSpec as P
-from jax.experimental.shard_map import shard_map
-from jax.experimental.pallas.ops.tpu import flash_attention
-import dataclasses
 import orbax.checkpoint as ocp
-from typing import Any, Callable
-from tpu import ShardingRules, _logical_to_sharding, _logical_to_physical
+from flax import struct
+from jax.experimental.pallas.ops.tpu import flash_attention
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as P
+from tpu import ShardingRules, _logical_to_physical, _logical_to_sharding
 
 
 @struct.dataclass

@@ -7,7 +7,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.10"
-jax = {version = "*", extras = ["tpu"], optional = true}
+jax = {version = "0.4.31", extras = ["tpu"]}
 tensorflow = "*"
 flax = "*"
 tqdm = "*"
@@ -17,9 +17,15 @@ tensorboard-plugin-profile = "*"
 tensorboard = "*"
 tensorboardX = "*"
 orbax = "*"
+datasets = "^2.15"
+gcsfs = "*"
 
-[tool.poetry.extras]
-tpu = ["jax"]
+[tool.poetry.group.dev.dependencies]
+ruff = "*"
+isort = "*"
+black = "*"
+mypy = "*"
+ipykernel = "^6.29.5"
 
 [build-system]
 requires = ["poetry-core"]
@@ -31,8 +37,22 @@ line-length = 120
 [tool.ruff]
 line-length = 120
 
-[tool.poetry.scripts]
-format = "poetry run black ."
-lint = "poetry run ruff check ."
-lint-fix = "poetry run ruff check --fix ."
-format-and-lint = "poetry run black . && poetry run ruff check --fix ."
+[tool.poe]
+poetry_command = ""
+
+[tool.poe.tasks]
+black = "black ."
+isort = "isort ."
+format = ["black", "isort"]
+lint = "ruff check ."
+mypy = "mypy ."
+
+[[tool.poetry.source]]
+name = "jax-releases"
+url = "https://storage.googleapis.com/jax-releases/jax_nightly_releases.html"
+priority = "supplemental"
+
+[[tool.poetry.source]]
+name = "libtpu-releases"
+url = "https://storage.googleapis.com/jax-releases/libtpu_releases.html"
+priority = "supplemental"

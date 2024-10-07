@@ -1,9 +1,10 @@
+import io
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from tensorboardX import SummaryWriter
-import io
 
 
 def visualize_token_prediction_difficulty(
@@ -53,9 +54,7 @@ def visualize_token_prediction_difficulty(
 
         if writer is not None:
             if step is None:
-                raise ValueError(
-                    "Both 'writer' and 'step' must be provided to save to TensorBoard."
-                )
+                raise ValueError("Both 'writer' and 'step' must be provided to save to TensorBoard.")
 
             # Convert PIL image to numpy array
             img_array = np.array(img).transpose((2, 0, 1))  # HWC to CHW format

@@ -1,15 +1,18 @@
 import functools
+
 import jax
 import jax.numpy as jnp
-import numpy as np
 import model
+import numpy as np
+
 
 def print_test_passed(test_name):
-    GREEN = '\033[92m'
-    BOLD = '\033[1m'
-    RESET = '\033[0m'
-    CHECKMARK = '\u2713'
+    GREEN = "\033[92m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+    CHECKMARK = "\u2713"
     print(f"{GREEN}{BOLD}[{CHECKMARK}] Test passed:{RESET} {test_name}")
+
 
 def assert_mask_equal(actual, expected, test_name):
     if not jnp.array_equal(actual, expected):
@@ -20,6 +23,7 @@ def assert_mask_equal(actual, expected, test_name):
         print(expected)
         raise AssertionError(f"{test_name} failed")
 
+
 def test_make_attention_mask():
     # Test 1: Basic causal mask
     q_len, k_len = 4, 4
@@ -29,12 +33,18 @@ def test_make_attention_mask():
     causal = True
 
     mask = model.make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal)
-    expected_mask = jnp.array([
-        [[[True, False, False, False],
-          [True, True, False, False],
-          [True, True, True, False],
-          [True, True, True, True]]]
-    ])
+    expected_mask = jnp.array(
+        [
+            [
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, True, True, False],
+                    [True, True, True, True],
+                ]
+            ]
+        ]
+    )
     assert_mask_equal(mask, expected_mask, "Basic causal mask test")
     print_test_passed("Basic causal mask")
 
@@ -49,12 +59,18 @@ def test_make_attention_mask():
     k_segment_ids = jnp.array([[1, 1, 2, 2]])
     causal = True
     mask = model.make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal)
-    expected_mask = jnp.array([
-        [[[True, False, False, False],
-          [True, True, False, False],
-          [False, False, True, False],
-          [False, False, True, True]]]
-    ])
+    expected_mask = jnp.array(
+        [
+            [
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [False, False, True, False],
+                    [False, False, True, True],
+                ]
+            ]
+        ]
+    )
     assert_mask_equal(mask, expected_mask, "Segmented causal mask test")
     print_test_passed("Segmented causal mask")
 
@@ -65,10 +81,7 @@ def test_make_attention_mask():
     q_offset = jnp.array([2])
     causal = True
     mask = model.make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal)
-    expected_mask = jnp.array([
-        [[[True, True, True, False],
-          [True, True, True, True]]]
-    ])
+    expected_mask = jnp.array([[[[True, True, True, False], [True, True, True, True]]]])
     assert_mask_equal(mask, expected_mask, "Causal mask with offset test")
     print_test_passed("Causal mask with offset")
 
@@ -79,14 +92,12 @@ def test_make_attention_mask():
     q_offset = jnp.array([0, 0])
     causal = True
     mask = model.make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal)
-    expected_mask = jnp.array([
-        [[[True, False, False],
-          [True, True, False],
-          [True, True, True]]],
-        [[[True, False, False],
-          [True, True, False],
-          [True, True, True]]]
-    ])
+    expected_mask = jnp.array(
+        [
+            [[[True, False, False], [True, True, False], [True, True, True]]],
+            [[[True, False, False], [True, True, False], [True, True, True]]],
+        ]
+    )
     assert_mask_equal(mask, expected_mask, "Multiple batches test")
     print_test_passed("Mask with multiple batches")
 
@@ -101,14 +112,7 @@ def test_attention_impl_equivalence():
 
     # Create a dummy config
     rules = model.ShardingRules(
-        batch='x',
-        sequence=None,
-        d_model='x',
-        query_heads=None,
-        key_heads=None,
-        key_dim=None,
-        ffw=None,
-        vocab=None
+        batch="x", sequence=None, d_model="x", query_heads=None, key_heads=None, key_dim=None, ffw=None, vocab=None
     )
 
     cfg = model.Config(
@@ -125,7 +129,7 @@ def test_attention_impl_equivalence():
         weight_dtype_at_rest=jnp.float32,
         active_weight_dtype=jnp.float32,
         rules=rules,
-        mesh=model.create_mesh()
+        mesh=model.create_mesh(),
     )
 
     # Create dummy inputs
@@ -150,11 +154,10 @@ def test_attention_impl_equivalence():
     jnp.allclose(output_attention, output_attention_kernel, atol=atol, rtol=rtol)
     print_test_passed("Kernel and manual implementation equivalence")
 
+
 def test_cross_entropy_loss(print_intermediates: bool = False):
     # Test case : Mixed predictions with masking
-    logits = jnp.array([[2.0, 1.0, 0.0],
-                            [0.0, 2.0, 1.0],
-                            [1.0, 0.0, 2.0]])
+    logits = jnp.array([[2.0, 1.0, 0.0], [0.0, 2.0, 1.0], [1.0, 0.0, 2.0]])
     labels = jnp.array([0, 1, 2])
     mask = jnp.array([1, 1, 0])  # Last prediction is masked
 
@@ -176,6 +179,7 @@ def test_cross_entropy_loss(print_intermediates: bool = False):
         print(f"Test {'passed' if np.isclose(loss, expected_loss, atol=1e-4) else 'failed'}\n")
     print_test_passed("Cross Entropy loss correctness.")
 
+
 def test_incremental_prefill():
     # Set up the configuration
     inference_config = model.Config(
@@ -192,7 +196,7 @@ def test_incremental_prefill():
         weight_dtype_at_rest=jnp.float32,
         active_weight_dtype=jnp.float32,
         rules=model.mdl_parallel_rules,
-        mesh=model.create_mesh()
+        mesh=model.create_mesh(),
     )
 
     # Initialize weights and cache
@@ -225,14 +229,27 @@ def test_incremental_prefill():
 
     # Assert cache consistency
     for layer in range(inference_config.num_layers):
-        np.testing.assert_allclose(prefill_cache_c.k[layer][:, :, :9, :].astype(jnp.float32), prefill_cache.k[layer][:, :, :9, :].astype(jnp.float32), rtol=2e-2)
-        np.testing.assert_allclose(prefill_cache_c.v[layer][:, :, :9, :].astype(jnp.float32), prefill_cache.v[layer][:, :, :9, :].astype(jnp.float32), rtol=2e-2)
+        np.testing.assert_allclose(
+            prefill_cache_c.k[layer][:, :, :9, :].astype(jnp.float32),
+            prefill_cache.k[layer][:, :, :9, :].astype(jnp.float32),
+            rtol=2e-2,
+        )
+        np.testing.assert_allclose(
+            prefill_cache_c.v[layer][:, :, :9, :].astype(jnp.float32),
+            prefill_cache.v[layer][:, :, :9, :].astype(jnp.float32),
+            rtol=2e-2,
+        )
 
     # Assert logits consistency for the first 6 tokens
-    assert jnp.array_equal(jnp.argmax(logits_c[0, :6], axis=-1), jnp.argmax(logits_a[0, :6], axis=-1)), "Logits mismatch for first 6 tokens"
-    assert jnp.array_equal(jnp.argmax(logits_c[0, 6:9], axis=-1), jnp.argmax(logits_b[0, :3], axis=-1)), "Logits mismatch for tokens 6 to 9"
+    assert jnp.array_equal(
+        jnp.argmax(logits_c[0, :6], axis=-1), jnp.argmax(logits_a[0, :6], axis=-1)
+    ), "Logits mismatch for first 6 tokens"
+    assert jnp.array_equal(
+        jnp.argmax(logits_c[0, 6:9], axis=-1), jnp.argmax(logits_b[0, :3], axis=-1)
+    ), "Logits mismatch for tokens 6 to 9"
 
     print_test_passed("Incremental prefill correctness.")
+
 
 def test_overtrain_and_sample_simple_sequence():
     # TODO(sholto): Extend with multiple sequence ids?
@@ -271,44 +288,44 @@ def test_overtrain_and_sample_simple_sequence():
         weight_dtype_at_rest=jnp.float32,
         active_weight_dtype=jnp.float32,
         rules=model.mdl_parallel_rules,
-        mesh=model.create_mesh()
+        mesh=model.create_mesh(),
     )
     weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
     opt_state = model.init_adam_state(weights)
-    step = jax.jit(model.update_step, static_argnames='cfg')
+    step = jax.jit(model.update_step, static_argnames="cfg")
     step = functools.partial(step, cfg=cfg)
 
-    test_batch = jnp.arange(1, 256+2)[None, :]
-    test_batch = jnp.repeat(test_batch, repeats = 8, axis=0)
+    test_batch = jnp.arange(1, 256 + 2)[None, :]
+    test_batch = jnp.repeat(test_batch, repeats=8, axis=0)
     batch = {
-        'x': test_batch[:, :-1],
-        'y': test_batch[:, 1:],
-        'segment_ids': jnp.ones((8, 256)),
+        "x": test_batch[:, :-1],
+        "y": test_batch[:, 1:],
+        "segment_ids": jnp.ones((8, 256)),
     }
     batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
-    ckpt_path = '/tmp/test_dir'
+    ckpt_path = "/tmp/test_dir"
     ckpt_manager = model.make_mgnr(path=ckpt_path, erase=True)
-    
+
     losses = []
     for s in range(0, 50):
-        loss, weights, opt_state, _ = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, s)
+        loss, weights, opt_state, _ = step(weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, s)
         losses.append(loss)
 
         if s % 25 == 0:
             model.save(ckpt_manager, weights, opt_state, s)
-    
+
     prompt = jnp.arange(1, 60)
     cache = model.KVCache.init(cfg=inference_config, batch_size=1, max_seq_len=2048)
     tokens, cache = model.sample_from_prompt(prompt, weights, cache, inference_config, batch_idx=0, num_steps=13)
     # Validate that we do indeed sample the sequence we overtrained in.
-    assert jnp.array_equal(jnp.array(tokens), jnp.arange(60, 60+13))
+    assert jnp.array_equal(jnp.array(tokens), jnp.arange(60, 60 + 13))
     print_test_passed("Overtrain and sample from simple model.")
 
     weights, opt_state = model.load(ckpt_manager, cfg, step=25)
     new_losses = []
     for s in range(26, 50):
-        loss, weights, opt_state, _ = step(weights, batch['x'], batch['segment_ids'], batch['y'], opt_state, s)
+        loss, weights, opt_state, _ = step(weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, s)
         new_losses.append(loss)
     assert losses[26:50] == new_losses[0:24]
     print_test_passed("Reload mid-run checkpoint with identical training continuation.")
