@@ -44,9 +44,29 @@ Host *
 
 You can then use the remote editor to edit code, and push/pull to sync.
 
+```sh
 curl -sSL https://install.python-poetry.org | python3 -
 echo 'export PATH="~/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
-poetry install --extras "tpu"
+poetry install
+```
+
+All of these within minformer/
+To start a poetry venv:
+
+```
+poetry shell
+```
+
+To start a jupyter kernel (you shouldn't need to do this, because this should be default done by the .toml.)
+
+```
+python -m ipykernel install --user --name=minformer_kernel
+
+# Run
+jupyter notebook
+# Then connect via 'connect to an existing jupyter server'.
+```
+
 
 ## Profiling
 

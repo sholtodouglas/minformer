@@ -19,6 +19,8 @@ tensorboardX = "*"
 orbax = "*"
 datasets = "^2.15"
 gcsfs = "*"
+jupyter = "^1.1.1"
+ipykernel = "^6.29.5"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "*"

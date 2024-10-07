@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
 
-VOCAB = ["P", "U", "A", "C", "G", "T"]  # padding, unknown, A, C, G, T
+VOCAB = ["P", "S", "E", "U", "A", "C", "G", "T"]  #  padding, start, end, unknown, A, C, G, T
 VOCAB_SIZE = len(VOCAB)
 stoi = {ch: i for i, ch in enumerate(VOCAB)}
 itos = {i: ch for i, ch in enumerate(VOCAB)}
@@ -16,8 +16,9 @@ decode = lambda x: "".join([itos.get(i, "U") for i in x])
 def preprocess_dna_sequence(x, sequence_length):
     # remove all non ACGT characters and convert to uppercase
     x = re.sub(r"[^ACGT]", "", x.upper())
-    # split into chunks of SEQ_LEN
-    return [x[i : i + sequence_length] for i in range(0, len(x), sequence_length)]
+    start_end_adjusted_seqlen = sequence_length - 2
+    # split into chunks of SEQ_LEN, append start/end token.
+    return ['S' + x[i : i + start_end_adjusted_seqlen] + 'E' for i in range(0, len(x), start_end_adjusted_seqlen)]
 
 
 def process_and_save_tfrecords(dataset, output_dir, sequence_length=8192):
@@ -58,7 +59,7 @@ def process_and_save_tfrecords(dataset, output_dir, sequence_length=8192):
                 sequence_number = 1
 
     # Save any remaining tokens
-    if current_tokens:
+    if len(current_tokens) > 0:
         save_record(output_dir, record_count, current_tokens, current_segment_ids, sequence_length)
 
 
