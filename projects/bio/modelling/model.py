@@ -223,8 +223,16 @@ class KVCache:
     def time_axis(self) -> int:
         return 2
 
-def _generate_fixed_pos_embedding(
-    features, length, min_timescale=1.0, max_timescale=10000.0
+def segment_ids_to_positions(segment_ids):
+  """Counts positions for segment ids."""
+  def scan_fun(a, b):
+    return ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
+  vals = (jnp.zeros_like(segment_ids), segment_ids)
+  return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
+
+
+def _generate_pos_embeddings(
+    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16000.0
 ) -> tuple[jax.Array, jax.Array]:
   """Generate Sin/Cos for Rotary Embeddings.
 
@@ -236,12 +244,12 @@ def _generate_fixed_pos_embedding(
 
   The outputs are computed as:
 
-    output_sin[i, j] = sin(i / timescale[j])
-    output_cos[i, j] = cos(i / timescale[j])
+    sin[b, t, j] = sin(rope_pos[b, t] / timescale[j])
+    cos[b, t, j] = cos(rope_pos[b, t] / timescale[j])
 
   Args:
-    features: an integer
-    length: an integer
+    postions: [batch, time]
+    features: d_head.
     min_timescale: an optional float
     max_timescale: an optional float
 
@@ -258,8 +266,8 @@ def _generate_fixed_pos_embedding(
   # catastrophic. bfloat16 rounds 257 to 256, but sin(257) is very different
   # from sin(256).
   sinusoid_inp = jnp.einsum(
-      'i , j -> i j',
-      jnp.arange(length),
+      'BT,k->BTk',
+      positions,
       rotational_frequency,
       precision=jax.lax.Precision.HIGHEST,
   )
@@ -271,13 +279,6 @@ def apply_rotary_embedding(x, sin, cos):
     x1, x2 = jnp.split(x, 2, axis=-1)
     sin, cos = sin[:, None, :, :], cos[:, None, :, :] # [B, T, head_dim] -> [B, h, T, head_dim]
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-
-# Helper functions for RoPE lookups
-def slice_at(table, index, length):
-    return jax.lax.dynamic_slice_in_dim(table, index, length)
-
-def slices_at(table, indices, length: int):
-    return jax.vmap(partial(slice_at, length=length), in_axes=(None, 0))(table, indices)
 
 
 def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal: bool):
@@ -430,20 +431,20 @@ def forward_layer(x: jax.Array, segment_ids: jax.Array, layer: Layer, sin: jax.A
 def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None):
 
     internals = {}
-    # Embed input tokens [B, T] -> [B, T D]
+ # Embed input tokens [B, T] -> [B, T D]
     x = weights.embedding[x, :]
-    batch, seq_len = x.shape[0], x.shape[1]
-    sin, cos = _generate_fixed_pos_embedding(cfg.key_dim, cfg.max_seq_len)
-    
+    batch = x.shape[0]
+    positions = segment_ids_to_positions(segment_ids)
     # Apply rotary embeddings: [B, T, head_dim]
     if cache is not None:
         # For inference with cache, we need to index the positional embeddings
         start_indices = cache.lengths
     else:
         start_indices = jnp.zeros((batch,), dtype=jnp.int32)
-
-    sin = slices_at(sin, start_indices, seq_len)
-    cos = slices_at(cos, start_indices, seq_len)
+    # NOTE: At inference time this only works for UNPACKED sequences.
+    positions = start_indices[:, None] + positions
+    # [B, T, head_dim]
+    sin, cos = _generate_pos_embeddings(positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
 
     for idx, layer in enumerate(weights.layers):
         x, k, v = forward_layer(x, segment_ids, layer, sin, cos, idx, cfg, cache)

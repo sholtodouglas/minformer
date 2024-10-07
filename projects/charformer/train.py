@@ -1,6 +1,6 @@
 """Script for running training with TensorBoard logging, configurable parameters, and configuration tracking.
 
-python3 projects/charformer/train.py --checkpoint_dir=/tmp/charformer_checkpoints/test_run --checkpoint_interval=1000
+python3 projects/charformer/train.py --checkpoint_dir=/tmp/charformer_checkpoints/test_run --checkpoint_interval=100000
 
 """
 import sys
