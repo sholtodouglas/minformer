@@ -1,6 +1,4 @@
-import io
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont

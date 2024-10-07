@@ -215,11 +215,13 @@ class KVCache:
 
 
 def segment_ids_to_positions(segment_ids):
-  """Counts positions for segment ids."""
-  def scan_fun(a, b):
-    return ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
-  vals = (jnp.zeros_like(segment_ids), segment_ids)
-  return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
+    """Counts positions for segment ids."""
+
+    def scan_fun(a, b):
+        return ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
+
+    vals = (jnp.zeros_like(segment_ids), segment_ids)
+    return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
 
 
 def _generate_pos_embeddings(
@@ -239,31 +241,32 @@ def _generate_pos_embeddings(
     sin[b, t, j] = sin(rope_pos[b, t] / timescale[j])
     cos[b, t, j] = cos(rope_pos[b, t] / timescale[j])
 
-  Args:
-    postions: [batch, time]
-    features: d_head.
-    min_timescale: an optional float
-    max_timescale: an optional float
+    Args:
+        postions: [batch, time]
+        features: d_head.
+        min_timescale: an optional float
+        max_timescale: an optional float
 
-  Returns:
-    output_sin: a float32 Tensor with shape [length, features // 2]
-    output_cos: a float32 Tensor with shape [length, features // 2]
-  """
-  # Forked from
-  # flaxformer/components/embedding.py;l=592
-  fraction = jnp.arange(0, features, 2, dtype=jnp.float32) / features
-  timescale = min_timescale * (max_timescale / min_timescale) ** fraction
-  rotational_frequency = 1.0 / timescale
-  # Must use high precision einsum here, since rounding off to a bfloat16 is
-  # catastrophic. bfloat16 rounds 257 to 256, but sin(257) is very different
-  # from sin(256).
-  sinusoid_inp = jnp.einsum(
-      'BT,k->BTk',
-      positions,
-      rotational_frequency,
-      precision=jax.lax.Precision.HIGHEST,
-  )
-  return jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
+    Returns:
+        output_sin: a float32 Tensor with shape [length, features // 2]
+        output_cos: a float32 Tensor with shape [length, features // 2]
+    """
+    # Forked from
+    # flaxformer/components/embedding.py;l=592
+    fraction = jnp.arange(0, features, 2, dtype=jnp.float32) / features
+    timescale = min_timescale * (max_timescale / min_timescale) ** fraction
+    rotational_frequency = 1.0 / timescale
+    # Must use high precision einsum here, since rounding off to a bfloat16 is
+    # catastrophic. bfloat16 rounds 257 to 256, but sin(257) is very different
+    # from sin(256).
+    sinusoid_inp = jnp.einsum(
+        "BT,k->BTk",
+        positions,
+        rotational_frequency,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
+
 
 def apply_rotary_embedding(x, sin, cos):
     assert x.ndim == 4
@@ -479,7 +482,7 @@ def forward(
     positions = start_indices[:, None] + positions
     # [B, T, head_dim]
     sin, cos = _generate_pos_embeddings(positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
-    
+
     for idx, layer in enumerate(weights.layers):
         x, k, v = forward_layer(x, segment_ids, layer, sin, cos, idx, cfg, cache)
         if cache is not None:

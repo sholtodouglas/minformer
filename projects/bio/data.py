@@ -1,7 +1,7 @@
 import gzip
 import os
 import re
-from typing import Any, List, Tuple
+from typing import Any, List
 
 import numpy as np
 import tensorflow as tf
