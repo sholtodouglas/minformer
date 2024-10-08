@@ -6,7 +6,7 @@ import tensorflow as tf
 from tqdm import tqdm
 
 
-VOCAB = ["P", "S", "E", "U", "A", "C", "G", "T"]  #  padding, start, end, unknown, A, C, G, T
+VOCAB = ["P", "U", "A", "C", "G", "T"]  #  padding, unknown, A, C, G, T
 VOCAB_SIZE = len(VOCAB)
 stoi = {ch: i for i, ch in enumerate(VOCAB)}
 itos = {i: ch for i, ch in enumerate(VOCAB)}
@@ -17,9 +17,8 @@ detokenize = lambda x: "".join([itos.get(i, "U") for i in x])
 def preprocess_dna_sequence(x, sequence_length):
     # remove all non ACGT characters and convert to uppercase
     x = re.sub(r"[^ACGT]", "", x.upper())
-    start_end_adjusted_seqlen = sequence_length - 2
     # split into chunks of SEQ_LEN, append start/end token.
-    return ['S' + x[i : i + start_end_adjusted_seqlen] + 'E' for i in range(0, len(x), start_end_adjusted_seqlen)]
+    return [x[i : i + sequence_length] for i in range(0, len(x), sequence_length)]
 
 
 def process_and_save_tfrecords(dataset, output_dir, sequence_length):

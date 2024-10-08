@@ -120,6 +120,7 @@ class Layer:
     w2: jax.Array | TensorInfo
     gamma1: jax.Array | TensorInfo
     gamma2: jax.Array | TensorInfo
+    gamma_final: jax.Array | TensorInfo
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -160,6 +161,11 @@ class Layer:
                 jax.nn.initializers.constant(1.0),
             ),
             gamma2=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
+                ("d_model",),
+                jax.nn.initializers.constant(1.0),
+            ),
+            gamma_final=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
@@ -415,7 +421,20 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale)
+        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
+                                                block_sizes=flash_attention.BlockSizes(
+                                                block_q=512,
+                                                block_k_major=512,
+                                                block_k=512,
+                                                block_b=1,
+                                                block_q_major_dkv=512,
+                                                block_k_major_dkv=512,
+                                                block_k_dkv=512,
+                                                block_q_dkv=512,
+                                                block_k_major_dq=512,
+                                                block_k_dq=512,
+                                                block_q_dq=512
+                                               ))
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
@@ -547,6 +566,8 @@ def forward(
             cache.k[idx] = k
             cache.v[idx] = v
 
+    # Final layer norm.
+    x = rms_norm(x, weights.gamma_final)
     # Project to vocabulary size
     logits = jnp.einsum("btd,dv->btv", x, weights.vocab_proj)
     if cache is not None:

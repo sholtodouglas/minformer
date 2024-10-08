@@ -19,16 +19,17 @@ import jax.numpy as jnp
 import modelling.model as model
 import numpy as np
 from tensorboardX import SummaryWriter
+from jax.profiler import trace
 import data_hf
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DNA Sequence Training Script")
-    parser.add_argument("--d_model", type=int, default=2048, help="Model dimension")
+    parser.add_argument("--d_model", type=int, default=1024, help="Model dimension")
     parser.add_argument("--ffw_multiplier", type=int, default=4, help="FFW multiplier")
     parser.add_argument("--query_heads", type=int, default=8, help="Number of query heads")
     parser.add_argument("--key_heads", type=int, default=8, help="Number of key heads")
-    parser.add_argument("--num_layers", type=int, default=16, help="Number of layers")
+    parser.add_argument("--num_layers", type=int, default=4, help="Number of layers")
     parser.add_argument("--key_dim", type=int, default=128, help="Key dimension")
     parser.add_argument("--vocab_size", type=int, default=8, help="Vocabulary size")
     parser.add_argument("--max_seq_len", type=int, default=16384, help="Maximum sequence length")
@@ -41,7 +42,7 @@ def parse_args():
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
     parser.add_argument(
-        "--log_dir", type=str, default="/tmp/logs/dna_training", help="Base directory for TensorBoard logs"
+        "--log_dir", type=str, default="/tmp/logs/plasmid", help="Base directory for TensorBoard logs"
     )
     parser.add_argument(
         "--checkpoint_dir", type=str, default="/tmp/dna_checkpoints", help="Directory for saving checkpoints"
@@ -163,14 +164,23 @@ def main():
             batch = process_batch(next(iter))
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
-            loss, weights, opt_state, internals = step(
-                weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
-            )
+            # Always profile on the first step so that we can think about optimisations.
+            if i == 0:
+                with trace(log_dir):
+                    loss, weights, opt_state, internals = step(
+                        weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
+                    )
+                    jax.block_until_ready(loss)
+            else:
+                loss, weights, opt_state, internals = step(
+                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
+                )
 
             if i % args.log_every == 0:
                 # Log loss and accuracy to TensorBoard
                 writer.add_scalar("loss", loss, i)
                 writer.add_scalar("accuracy", internals["accuracy"], i)
+                writer.add_scalar("num_tokens_per_batch", np.sum(batch['segment_ids'] != 0), i)
                 print(f"Step {i}, Loss: {loss}, Accuracy: {internals['accuracy']}")
                 log_metrics(writer, internals, i)
 

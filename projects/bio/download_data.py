@@ -81,7 +81,7 @@ def main():
             "LongSafari/open-genome", name="stage1", cache_dir=data_dir, data_files=data_files, num_proc=8
         )
         data_hf.process_and_save_tfrecords(
-            hf_ds["train"], os.path.join(output_dir, "stage1/train"), sequence_length=args.sequence_length,
+            hf_ds["train"], os.path.join(output_dir, "stage1/train_v2"), sequence_length=args.sequence_length,
         )
         # data_hf.process_and_save_tfrecords(hf_ds['test'], os.path.join(output_dir, "stage1/test"), sequence_length=16384)
     else:
