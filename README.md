@@ -22,7 +22,7 @@ cat /Users/sholto/.ssh/google_compute_engine.pub
 export TPU_ZONE=us-central1-a
 export TPU_SIZE=v3-8
 export PROJECT_ID=learning-from-play-303306
-export TPU_NAME=devbox1
+export TPU_NAME=devbox3
 
 gcloud compute tpus tpu-vm create $TPU_NAME --zone $TPU_ZONE --accelerator-type=$TPU_SIZE --version=tpu-ubuntu2204-base --project=$PROJECT_ID
 

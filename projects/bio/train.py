@@ -3,7 +3,7 @@
 
 For open genome:
 
-python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train/ --log_every=1
+python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v2/ --log_every=10
 
 """
 import argparse
@@ -29,13 +29,13 @@ def parse_args():
     parser.add_argument("--ffw_multiplier", type=int, default=4, help="FFW multiplier")
     parser.add_argument("--query_heads", type=int, default=8, help="Number of query heads")
     parser.add_argument("--key_heads", type=int, default=8, help="Number of key heads")
-    parser.add_argument("--num_layers", type=int, default=4, help="Number of layers")
+    parser.add_argument("--num_layers", type=int, default=8, help="Number of layers")
     parser.add_argument("--key_dim", type=int, default=128, help="Key dimension")
     parser.add_argument("--vocab_size", type=int, default=8, help="Vocabulary size")
     parser.add_argument("--max_seq_len", type=int, default=16384, help="Maximum sequence length")
     parser.add_argument("--max_lr", type=float, default=3e-4, help="Maximum learning rate")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=2000, help="Number of warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=50, help="Number of warmup steps")
     parser.add_argument("--total_steps", type=int, default=100000, help="Total number of training steps")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
