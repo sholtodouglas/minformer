@@ -47,7 +47,7 @@ You can then use the remote editor to edit code, and push/pull to sync.
 ```sh
 curl -sSL https://install.python-poetry.org | python3 -
 echo 'export PATH="~/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
-poetry install
+poetry install --extras "tpu"
 ```
 
 All of these within minformer/

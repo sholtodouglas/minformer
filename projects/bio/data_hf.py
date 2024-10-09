@@ -1,10 +1,10 @@
 import os
 import re
 from typing import Any
+
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
-
 
 VOCAB = ["P", "U", "A", "C", "G", "T"]  #  padding, unknown, A, C, G, T
 VOCAB_SIZE = len(VOCAB)
@@ -120,6 +120,7 @@ def load_and_retokenize_tfrecord(file_path: str) -> list[str]:
         segment_ids.append(seg_ids)
 
     return retokenized_data, segment_ids
+
 
 def create_iterator(file_pattern: str, batch_size: int, shuffle: bool = False):
     """Creates a python iterator to load batches."""

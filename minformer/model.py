@@ -2,18 +2,19 @@
 
 import dataclasses
 import math
+from collections import namedtuple
 from dataclasses import field
 from functools import partial
 from typing import Any, Callable
 
-from collections import namedtuple
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from flax import struct
+from jax import lax
+from jax.experimental import mesh_utils
 from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
-from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
 
 
@@ -74,6 +75,7 @@ def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRul
     """Converts logical to sharding."""
     return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
 
+
 @struct.dataclass
 class Config:
     d_model: int
@@ -100,6 +102,13 @@ class Config:
     total_steps: int = 10000
     # Rescale gradients which spike.
     grad_norm_clip: float = 1
+    # Convolutions
+    # Larger kernel size allows capturing more context but requires more memory and computation.
+    conv_kernel_size: int = 3
+    # Introduces downsampling, reduces sequence length. When you need to process very long sequences or reduce computational load.
+    conv_stride: int = 1
+    # Expands the receptive field, doesn't reduce sequence length. When you want to capture long-range dependencies without losing resolution.
+    conv_dilation: int = 1
 
 
 @struct.dataclass
@@ -121,6 +130,7 @@ class Layer:
     gamma1: jax.Array | TensorInfo
     gamma2: jax.Array | TensorInfo
     gamma_final: jax.Array | TensorInfo
+    conv_kernel: jax.Array | TensorInfo
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -169,6 +179,11 @@ class Layer:
                 jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
+            ),
+            conv_kernel=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.conv_kernel_size, cfg.d_model, cfg.d_model), cfg.weight_dtype_at_rest),
+                ("kernel", "d_model", "d_model"),
+                jax.nn.initializers.he_normal(in_axis=(0, 1), out_axis=2),
             ),
         )
 
@@ -421,22 +436,54 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
-                                                block_sizes=flash_attention.BlockSizes(
-                                                block_q=512,
-                                                block_k_major=512,
-                                                block_k=512,
-                                                block_b=1,
-                                                block_q_major_dkv=512,
-                                                block_k_major_dkv=512,
-                                                block_k_dkv=512,
-                                                block_q_dkv=512,
-                                                block_k_major_dq=512,
-                                                block_k_dq=512,
-                                                block_q_dq=512
-                                               ))
+        return flash_attention.flash_attention(
+            q,
+            k,
+            v,
+            segment_ids=segment_ids,
+            causal=True,
+            sm_scale=scale,
+            block_sizes=flash_attention.BlockSizes(
+                block_q=512,
+                block_k_major=512,
+                block_k=512,
+                block_b=1,
+                block_q_major_dkv=512,
+                block_k_major_dkv=512,
+                block_k_dkv=512,
+                block_q_dkv=512,
+                block_k_major_dq=512,
+                block_k_dq=512,
+                block_q_dq=512,
+            ),
+        )
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
+
+
+def conv1d(x, kernel, dilation=1, stride=1, causal=True):
+    dn = lax.conv_dimension_numbers(
+        x.shape,  # only ndim matters, not shape
+        kernel.shape,  # only ndim matters, not shape
+        ("NHC", "HIO", "NHC"),  # lhs, rhs, out
+    )
+
+    # Causal padding
+    if causal:
+        kernel_size = kernel.shape[0]
+        padding = (((kernel_size - 1) * dilation, 0),)
+    else:
+        padding = "SAME"  # if you don't want output size to change, else "VALID"
+
+    return lax.conv_general_dilated(
+        x,
+        kernel,
+        window_strides=(stride,),
+        padding=padding,
+        lhs_dilation=(1,),  # dilation of input sequence, not particularly useful
+        rhs_dilation=(dilation,),  # dilation of kernel which increases receptive field for long range dependencies
+        dimension_numbers=dn,
+    )
 
 
 def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
@@ -455,10 +502,17 @@ def forward_layer(
     cfg: Config,
     cache: KVCache | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    # First RMSNorm (Pre-LN for attention)
-
     # Cast layer to bfloat16 for faster operations.
     layer = jax.tree.map(lambda x: cfg.active_weight_dtype(x), layer)
+
+    # Initial convolution
+    with jax.named_scope("conv1d"):
+        # Apply causal convolution to downsample sequence
+        x = conv1d(x, layer.conv_kernel, dilation=cfg.conv_dilation, stride=cfg.conv_stride)
+        # Adjust segment_ids to match new sequence length if strided
+        segment_ids = segment_ids[:, :: cfg.conv_stride]
+
+    # First RMSNorm (Pre-LN for attention)
     with jax.named_scope("attn_pre_norm"):
         attn_in = rms_norm(x, layer.gamma1)
 
