@@ -6,6 +6,7 @@ For open genome:
 python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v2/ --log_every=10
 
 """
+
 import argparse
 import functools
 import os
@@ -14,13 +15,13 @@ from typing import Any
 
 # Assuming these are in the same directory or in the Python path
 import data
+import data_hf
 import jax
 import jax.numpy as jnp
 import modelling.model as model
 import numpy as np
-from tensorboardX import SummaryWriter
 from jax.profiler import trace
-import data_hf
+from tensorboardX import SummaryWriter
 
 
 def parse_args():
@@ -41,9 +42,7 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
-    parser.add_argument(
-        "--log_dir", type=str, default="/tmp/logs/plasmid", help="Base directory for TensorBoard logs"
-    )
+    parser.add_argument("--log_dir", type=str, default="/tmp/logs/plasmid", help="Base directory for TensorBoard logs")
     parser.add_argument(
         "--checkpoint_dir", type=str, default="/tmp/dna_checkpoints", help="Directory for saving checkpoints"
     )
@@ -180,7 +179,7 @@ def main():
                 # Log loss and accuracy to TensorBoard
                 writer.add_scalar("loss", loss, i)
                 writer.add_scalar("accuracy", internals["accuracy"], i)
-                writer.add_scalar("num_tokens_per_batch", np.sum(batch['segment_ids'] != 0), i)
+                writer.add_scalar("num_tokens_per_batch", np.sum(batch["segment_ids"] != 0), i)
                 print(f"Step {i}, Loss: {loss}, Accuracy: {internals['accuracy']}")
                 log_metrics(writer, internals, i)
 

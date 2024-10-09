@@ -2,19 +2,19 @@
 
 import dataclasses
 import math
+from collections import namedtuple
 from dataclasses import field
 from functools import partial
 from typing import Any, Callable
 
-from collections import namedtuple
 import jax
 import jax.numpy as jnp
-from jax import lax
 import orbax.checkpoint as ocp
 from flax import struct
+from jax import lax
+from jax.experimental import mesh_utils
 from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
-from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
 
 
@@ -74,6 +74,7 @@ def _logical_to_physical(logical: P, rules: ShardingRules):
 def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRules):
     """Converts logical to sharding."""
     return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
+
 
 @struct.dataclass
 class Config:
@@ -435,20 +436,27 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
-                                                block_sizes=flash_attention.BlockSizes(
-                                                block_q=512,
-                                                block_k_major=512,
-                                                block_k=512,
-                                                block_b=1,
-                                                block_q_major_dkv=512,
-                                                block_k_major_dkv=512,
-                                                block_k_dkv=512,
-                                                block_q_dkv=512,
-                                                block_k_major_dq=512,
-                                                block_k_dq=512,
-                                                block_q_dq=512
-                                               ))
+        return flash_attention.flash_attention(
+            q,
+            k,
+            v,
+            segment_ids=segment_ids,
+            causal=True,
+            sm_scale=scale,
+            block_sizes=flash_attention.BlockSizes(
+                block_q=512,
+                block_k_major=512,
+                block_k=512,
+                block_b=1,
+                block_q_major_dkv=512,
+                block_k_major_dkv=512,
+                block_k_dkv=512,
+                block_q_dkv=512,
+                block_k_major_dq=512,
+                block_k_dq=512,
+                block_q_dq=512,
+            ),
+        )
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
@@ -482,6 +490,7 @@ def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
     """Apply RMS normalization."""
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
     return gamma * x / rms
+
 
 def forward_layer(
     x: jax.Array,
