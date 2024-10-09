@@ -22,7 +22,7 @@ cat /Users/sholto/.ssh/google_compute_engine.pub
 export TPU_ZONE=us-central1-a
 export TPU_SIZE=v3-8
 export PROJECT_ID=learning-from-play-303306
-export TPU_NAME=devbox1
+export TPU_NAME=devbox3
 
 gcloud compute tpus tpu-vm create $TPU_NAME --zone $TPU_ZONE --accelerator-type=$TPU_SIZE --version=tpu-ubuntu2204-base --project=$PROJECT_ID
 
@@ -44,9 +44,29 @@ Host *
 
 You can then use the remote editor to edit code, and push/pull to sync.
 
+```sh
 curl -sSL https://install.python-poetry.org | python3 -
 echo 'export PATH="~/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 poetry install --extras "tpu"
+```
+
+All of these within minformer/
+To start a poetry venv:
+
+```
+poetry shell
+```
+
+To start a jupyter kernel (you shouldn't need to do this, because this should be default done by the .toml.)
+
+```
+python -m ipykernel install --user --name=minformer_kernel
+
+# Run
+jupyter notebook
+# Then connect via 'connect to an existing jupyter server'.
+```
+
 
 ## Profiling
 

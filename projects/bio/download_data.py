@@ -3,7 +3,7 @@
 
 python3 projects/bio/download_data.py
 
-python3 projects/bio/download_data.py --dataset open-genome --use-gcs --bucket-name minformer_data
+python3 projects/bio/download_data.py --dataset open-genome-imgpr --use-gcs --bucket-name minformer_data --sequence-length=16384
 """
 
 import argparse
@@ -26,6 +26,7 @@ def parse_args():
     )
     parser.add_argument("--use-gcs", action="store_true", help="Use Google Cloud Storage")
     parser.add_argument("--bucket-name", type=str, help="GCS bucket name")
+    parser.add_argument("--sequence-length", type=int, default=8192, help="Training seqlen")
     return parser.parse_args()
 
 
@@ -64,7 +65,7 @@ def main():
         )
         input_file_path = os.path.join(data_dir, "human_genome.fa.gz")
         download_file(url, input_file_path)
-        ds = data.DNADataset(sequence_length=8192)
+        ds = data.DNADataset(sequence_length=args.sequence_length)
         ds.create_tfrecords(
             input_file_path=input_file_path,
             output_dir=output_dir,
@@ -80,7 +81,7 @@ def main():
             "LongSafari/open-genome", name="stage1", cache_dir=data_dir, data_files=data_files, num_proc=8
         )
         data_hf.process_and_save_tfrecords(
-            hf_ds["train"], os.path.join(output_dir, "stage1/train"), sequence_length=16384
+            hf_ds["train"], os.path.join(output_dir, "stage1/train_v2"), sequence_length=args.sequence_length,
         )
         # data_hf.process_and_save_tfrecords(hf_ds['test'], os.path.join(output_dir, "stage1/test"), sequence_length=16384)
     else:

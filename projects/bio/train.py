@@ -1,3 +1,11 @@
+"""
+
+
+For open genome:
+
+python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v2/ --log_every=10
+
+"""
 import argparse
 import functools
 import os
@@ -10,30 +18,31 @@ import jax
 import jax.numpy as jnp
 import modelling.model as model
 import numpy as np
-import utils as bio_utils
 from tensorboardX import SummaryWriter
+from jax.profiler import trace
+import data_hf
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DNA Sequence Training Script")
-    parser.add_argument("--d_model", type=int, default=2048, help="Model dimension")
+    parser.add_argument("--d_model", type=int, default=1024, help="Model dimension")
     parser.add_argument("--ffw_multiplier", type=int, default=4, help="FFW multiplier")
     parser.add_argument("--query_heads", type=int, default=8, help="Number of query heads")
     parser.add_argument("--key_heads", type=int, default=8, help="Number of key heads")
-    parser.add_argument("--num_layers", type=int, default=16, help="Number of layers")
+    parser.add_argument("--num_layers", type=int, default=8, help="Number of layers")
     parser.add_argument("--key_dim", type=int, default=128, help="Key dimension")
     parser.add_argument("--vocab_size", type=int, default=8, help="Vocabulary size")
-    parser.add_argument("--max_seq_len", type=int, default=8192, help="Maximum sequence length")
+    parser.add_argument("--max_seq_len", type=int, default=16384, help="Maximum sequence length")
     parser.add_argument("--max_lr", type=float, default=3e-4, help="Maximum learning rate")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=2000, help="Number of warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=50, help="Number of warmup steps")
     parser.add_argument("--total_steps", type=int, default=100000, help="Total number of training steps")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
     parser.add_argument(
-        "--log_dir", type=str, default="/tmp/logs/dna_training", help="Base directory for TensorBoard logs"
+        "--log_dir", type=str, default="/tmp/logs/plasmid", help="Base directory for TensorBoard logs"
     )
     parser.add_argument(
         "--checkpoint_dir", type=str, default="/tmp/dna_checkpoints", help="Directory for saving checkpoints"
@@ -75,23 +84,6 @@ def log_metrics(writer, metrics, step):
             writer.add_scalar(key, value.item(), step)
 
 
-def eval_batch(
-    batch: Any,
-    dataset: data.DNADataset,
-    weights: model.Weights,
-    writer: SummaryWriter,
-    step: int,
-    cfg: model.Config,
-    batch_row: int = 0,
-):
-    _, internals = model.compute_loss(weights, batch["x"], batch["segment_ids"], batch["y"], cfg)
-    losses = internals["per_token_loss"]
-    length = jnp.sum(batch["segment_ids"][batch_row] != 0) - 1
-    sequence = dataset.detokenize(batch["y"][batch_row, :length])
-    losses = losses[batch_row, :length]
-    bio_utils.visualize_token_prediction_difficulty(sequence, losses, save_image=True, writer=writer, step=step)
-
-
 def main():
     args = parse_args()
 
@@ -101,10 +93,8 @@ def main():
     log_dir = os.path.join(args.log_dir, log_dir_name)
 
     # Data setup
-    ds = data.DNADataset(sequence_length=args.max_seq_len)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(script_dir, args.data_dir)
-    iter = ds.create_iterator(str(data_dir) + "record_*.tfrecord", batch_size=args.batch_size)
+    # TODO: Configure.
+    iter = data_hf.create_iterator(str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True)
 
     # Model configuration
     cfg = model.Config(
@@ -174,22 +164,28 @@ def main():
             batch = process_batch(next(iter))
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
-            # if i % args.eval_every == 0:
-            #     eval_batch(batch, ds, weights, writer, i, cfg)
-
-            loss, weights, opt_state, internals = step(
-                weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
-            )
+            # Always profile on the first step so that we can think about optimisations.
+            if i == 0:
+                with trace(log_dir):
+                    loss, weights, opt_state, internals = step(
+                        weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
+                    )
+                    jax.block_until_ready(loss)
+            else:
+                loss, weights, opt_state, internals = step(
+                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
+                )
 
             if i % args.log_every == 0:
                 # Log loss and accuracy to TensorBoard
                 writer.add_scalar("loss", loss, i)
                 writer.add_scalar("accuracy", internals["accuracy"], i)
+                writer.add_scalar("num_tokens_per_batch", np.sum(batch['segment_ids'] != 0), i)
                 print(f"Step {i}, Loss: {loss}, Accuracy: {internals['accuracy']}")
                 log_metrics(writer, internals, i)
 
             # Save checkpoint
-            if i % args.checkpoint_interval == 0:
+            if i % args.checkpoint_interval == 0 and i > 0:
                 print(f"Saving checkpoint at step {i}")
                 model.save(ckpt_manager, weights, opt_state, i)
 

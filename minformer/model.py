@@ -6,6 +6,7 @@ from dataclasses import field
 from functools import partial
 from typing import Any, Callable
 
+from collections import namedtuple
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -13,9 +14,66 @@ import orbax.checkpoint as ocp
 from flax import struct
 from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
+from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
-from tpu import ShardingRules, _logical_to_physical, _logical_to_sharding
 
+
+def create_mesh():
+    """Always 1D because only care about FSDP."""
+    devices = jax.devices()
+    mesh_shape = (len(devices),)
+    # Create a 1D mesh with all devices along the 'x' axis
+    mesh = jax.sharding.Mesh(mesh_utils.create_device_mesh(mesh_shape, devices), ("x",))
+    return mesh
+
+
+ShardingRules = namedtuple(
+    "FSDPRules",
+    [
+        "batch",
+        "sequence",
+        "d_model",
+        "query_heads",
+        "key_heads",
+        "key_dim",
+        "ffw",
+        "vocab",
+    ],
+)
+
+# Define sharding rules for Fully Sharded Data Parallelism (FSDP)
+fsdp_rules = ShardingRules(
+    batch="x",  # Shard batch dimension
+    sequence=None,  # Don't shard sequence dimension
+    d_model="x",  # Shard model dimension
+    query_heads=None,
+    key_heads=None,
+    key_dim=None,
+    ffw=None,
+    vocab=None,
+)
+
+# Define sharding rules for model parallelism
+mdl_parallel_rules = ShardingRules(
+    batch=None,
+    sequence=None,
+    d_model=None,
+    query_heads="x",  # Shard query heads
+    key_heads="x",  # Shard key heads
+    key_dim=None,
+    ffw="x",  # Shard feed-forward layer
+    vocab=None,
+)
+
+
+def _logical_to_physical(logical: P, rules: ShardingRules):
+    """Converts logical to physical pspec."""
+    return P(*(getattr(rules, axis) for axis in logical))
+
+
+def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRules):
+    """Converts logical to sharding."""
+    return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
 
 @struct.dataclass
 class Config:
@@ -70,6 +128,7 @@ class Layer:
     w2: jax.Array | TensorInfo
     gamma1: jax.Array | TensorInfo
     gamma2: jax.Array | TensorInfo
+    gamma_final: jax.Array | TensorInfo
     conv_kernel: jax.Array | TensorInfo
 
     @classmethod
@@ -115,10 +174,15 @@ class Layer:
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
             ),
+            gamma_final=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
+                ("d_model",),
+                jax.nn.initializers.constant(1.0),
+            ),
             conv_kernel=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.conv_kernel_size, cfg.d_model, cfg.d_model), cfg.weight_dtype_at_rest),
                 ("kernel", "d_model", "d_model"),
-                jax.nn.initializers.constant(1.0),
+                jax.nn.initializers.he_normal(in_axis=(0, 1), out_axis=2),
             ),
         )
 
@@ -128,7 +192,6 @@ class Weights:
     layers: list[Layer]
     embedding: jax.Array | TensorInfo
     vocab_proj: jax.Array | TensorInfo
-    conv_kernel: jax.Array | TensorInfo
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -143,11 +206,6 @@ class Weights:
                 jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype_at_rest),
                 ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-            ),
-            conv_kernel=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.conv_kernel_size, cfg.d_model, cfg.d_model), cfg.weight_dtype_at_rest),
-                ("kernel", "d_model", "d_model"),
-                jax.nn.initializers.constant(1.0),
             ),
         )
 
@@ -245,7 +303,7 @@ def segment_ids_to_positions(segment_ids):
 
 
 def _generate_pos_embeddings(
-    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16000.0
+    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16384.0
 ) -> tuple[jax.Array, jax.Array]:
     """Generate Sin/Cos for Rotary Embeddings.
 
@@ -377,7 +435,20 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale)
+        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
+                                                block_sizes=flash_attention.BlockSizes(
+                                                block_q=512,
+                                                block_k_major=512,
+                                                block_k=512,
+                                                block_b=1,
+                                                block_q_major_dkv=512,
+                                                block_k_major_dkv=512,
+                                                block_k_dkv=512,
+                                                block_q_dkv=512,
+                                                block_k_major_dq=512,
+                                                block_k_dq=512,
+                                                block_q_dq=512
+                                               ))
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
@@ -411,7 +482,6 @@ def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
     """Apply RMS normalization."""
     rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
     return gamma * x / rms
-
 
 def forward_layer(
     x: jax.Array,
@@ -541,6 +611,8 @@ def forward(
             cache.k[idx] = k
             cache.v[idx] = v
 
+    # Final layer norm.
+    x = rms_norm(x, weights.gamma_final)
     # Project to vocabulary size
     logits = jnp.einsum("btd,dv->btv", x, weights.vocab_proj)
     if cache is not None:

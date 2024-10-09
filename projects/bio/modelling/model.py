@@ -13,37 +13,67 @@ import orbax.checkpoint as ocp
 from flax import struct
 from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
+from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
 
 
 def create_mesh():
     """Always 1D because only care about FSDP."""
     devices = jax.devices()
-    mesh = jax.sharding.Mesh(devices, ("x",))
+    mesh_shape = (len(devices),)
+    # Create a 1D mesh with all devices along the 'x' axis
+    mesh = jax.sharding.Mesh(mesh_utils.create_device_mesh(mesh_shape, devices), ("x",))
     return mesh
 
 
 ShardingRules = namedtuple(
-    "FSDPRules", ["batch", "sequence", "d_model", "query_heads", "key_heads", "key_dim", "ffw", "vocab"]
+    "FSDPRules",
+    [
+        "batch",
+        "sequence",
+        "d_model",
+        "query_heads",
+        "key_heads",
+        "key_dim",
+        "ffw",
+        "vocab",
+    ],
 )
 
+# Define sharding rules for Fully Sharded Data Parallelism (FSDP)
 fsdp_rules = ShardingRules(
-    batch="x", sequence=None, d_model="x", query_heads=None, key_heads=None, key_dim=None, ffw=None, vocab=None
+    batch="x",  # Shard batch dimension
+    sequence=None,  # Don't shard sequence dimension
+    d_model="x",  # Shard model dimension
+    query_heads=None,
+    key_heads=None,
+    key_dim=None,
+    ffw=None,
+    vocab=None,
 )
 
+# Define sharding rules for model parallelism
 mdl_parallel_rules = ShardingRules(
-    batch=None, sequence=None, d_model=None, query_heads="x", key_heads="x", key_dim=None, ffw="x", vocab=None
+    batch=None,
+    sequence=None,
+    d_model=None,
+    query_heads="x",  # Shard query heads
+    key_heads="x",  # Shard key heads
+    key_dim=None,
+    ffw="x",  # Shard feed-forward layer
+    vocab=None,
 )
 
 
 def _logical_to_physical(logical: P, rules: ShardingRules):
     """Converts logical to physical pspec."""
-    return P(*(getattr(rules, l) for l in logical))
+    return P(*(getattr(rules, axis) for axis in logical))
 
 
 def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRules):
     """Converts logical to sharding."""
     return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
+
 
 
 @struct.dataclass
@@ -144,6 +174,7 @@ class Weights:
     layers: list[Layer]
     embedding: jax.Array | TensorInfo
     vocab_proj: jax.Array | TensorInfo
+    gamma_final: jax.Array | TensorInfo
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -158,6 +189,11 @@ class Weights:
                 jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype_at_rest),
                 ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            ),
+            gamma_final=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
+                ("d_model",),
+                jax.nn.initializers.constant(1.0),
             ),
         )
 
@@ -255,7 +291,7 @@ def segment_ids_to_positions(segment_ids):
 
 
 def _generate_pos_embeddings(
-    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16000.0
+    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16384.0
 ) -> tuple[jax.Array, jax.Array]:
     """Generate Sin/Cos for Rotary Embeddings.
 
@@ -351,6 +387,8 @@ def attention(
     """
     # Div sqrt(key_dim)
     scale = q.shape[-1] ** -0.5
+    assert q.dtype == jnp.float32
+    assert k.dtype == jnp.float32
     qk = jnp.einsum("bhtd,bhTd->bhtT", q, k) * scale
     mask = make_attention_mask(q.shape[2], k.shape[2], q_segment_ids, k_segment_ids, q_offset, cfg.causal)
     # Apply the combined mask
@@ -383,7 +421,20 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale)
+        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
+                                                block_sizes=flash_attention.BlockSizes(
+                                                block_q=512,
+                                                block_k_major=512,
+                                                block_k=512,
+                                                block_b=1,
+                                                block_q_major_dkv=512,
+                                                block_k_major_dkv=512,
+                                                block_k_dkv=512,
+                                                block_q_dkv=512,
+                                                block_k_major_dq=512,
+                                                block_k_dq=512,
+                                                block_q_dq=512
+                                               ))
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
@@ -505,6 +556,8 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
             cache.k[idx] = k
             cache.v[idx] = v
 
+    # Final layer norm.
+    x = rms_norm(x, weights.gamma_final)
     # Project to vocabulary size
     logits = jnp.einsum("btd,dv->btv", x, weights.vocab_proj)
     if cache is not None:
