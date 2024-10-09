@@ -3,7 +3,7 @@
 
 For open genome:
 
-python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v2/ --log_every=10
+python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v3/ --log_every=10
 
 """
 import argparse
@@ -53,15 +53,6 @@ def parse_args():
     )
     return parser.parse_args()
 
-
-def process_batch(batch):
-    batch_size = batch["x"].shape[0]
-    dummy = np.zeros((batch_size, 1), dtype=jnp.int32)
-    return {
-        "x": np.concatenate([batch["x"][:, :-1], dummy], axis=-1),
-        "y": np.concatenate([batch["x"][:, 1:], dummy], axis=-1),
-        "segment_ids": np.concatenate([batch["segment_ids"][:, :-1], dummy], axis=-1),
-    }
 
 
 def clean_key(key):
@@ -161,7 +152,7 @@ def main():
         )
 
         for i in range(start_step, cfg.total_steps):
-            batch = process_batch(next(iter))
+            batch = model.process_batch(next(iter), cfg)
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
             # Always profile on the first step so that we can think about optimisations.

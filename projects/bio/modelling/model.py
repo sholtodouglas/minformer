@@ -15,6 +15,7 @@ from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
 from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
+import numpy as np
 
 
 def create_mesh():
@@ -102,6 +103,13 @@ class Config:
     total_steps: int = 10000
     # Rescale gradients which spike.
     grad_norm_clip: float = 0.1
+    # MEGABYTE only https://openreview.net/pdf?id=JTmO2V9Xpz
+    mega_byte: bool = False
+    patch_size: int | None = 1
+
+    @property
+    def patch_d(self):
+        return self.d_model // self.patch_size
 
 
 @struct.dataclass
@@ -111,6 +119,18 @@ class TensorInfo:
     initializer: Callable | None = None
     metadata: dict = field(default_factory=dict)
 
+
+def process_batch(batch, cfg):
+    batch_size = batch["x"].shape[0]
+    # Patch size lets us handle megabyte style methods to reduce effective seqlen.
+    # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
+    dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
+    return {
+        "x": np.concatenate([batch["x"][:, :-cfg.patch_size], dummy], axis=-1),
+        "y": np.concatenate([batch["x"][:, cfg.patch_size:], dummy], axis=-1),
+        # TODO(sholto): Maybe we should padd in dataset so we are't attending to next seq.
+        "segment_ids": np.concatenate([batch["segment_ids"][:, :-cfg.patch_size], dummy], axis=-1),
+    }
 
 @struct.dataclass
 class Layer:
@@ -178,20 +198,25 @@ class Weights:
 
     @classmethod
     def abstract(cls, cfg: Config):
+        if cfg.mega_byte:
+            embed_dim = cfg.patch_d
+        else:
+            embed_dim = cfg.d_model
+
         return Weights(
             layers=[Layer.abstract(cfg) for _ in range(cfg.num_layers)],
             embedding=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), cfg.weight_dtype_at_rest),
+                jax.ShapeDtypeStruct((cfg.vocab_size, embed_dim), cfg.weight_dtype_at_rest),
                 ("vocab", "d_model"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
             vocab_proj=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype_at_rest),
+                jax.ShapeDtypeStruct((embed_dim, cfg.vocab_size), cfg.weight_dtype_at_rest),
                 ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
             gamma_final=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
+                jax.ShapeDtypeStruct((embed_dim,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
             ),
@@ -537,7 +562,22 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     internals = {}
     # Embed input tokens [B, T] -> [B, T D]
     x = weights.embedding[x, :]
-    batch = x.shape[0]
+    batch, time = x.shape[0], x.shape[1]
+    # To reduce attention cost, we can do something like MEGABYTE.
+    if cfg.mega_byte:
+        # Assume in this scenario embedding D is much smaller, lets call it patch_D.
+        assert x.shape[-1] == cfg.patch_d
+        # [B,T,patch_d] -> [B, T//patch_size, patch_size, patch_d]
+        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        # Sub sampling segment ids will work because they are padded to multiples of patch
+        # size.
+        # TODO(sholto): Do a causal conv over patch instead.
+        x = x.reshape(batch, time//cfg.patch_size, cfg.d_model)
+        segment_ids = segment_ids[:, ::cfg.patch_size]
+        assert x.shape[1] == segment_ids.shape[1]
+    # Reshape sequence to [B, T/patch_size, patch_size, patch_D]
+    # Run a causal conv over each patch to give local contextual information.
+    # We then also need to subsample segment_ids to get the right positions.
     positions = segment_ids_to_positions(segment_ids)
     # Apply rotary embeddings: [B, T, head_dim]
     if cache is not None:
@@ -555,6 +595,13 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
         if cache is not None:
             cache.k[idx] = k
             cache.v[idx] = v
+
+    # At this point, if we are MEGABYTE:
+    # We have shape [B, T//patch_size, D]
+    if cfg.mega_byte:
+        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        x = x.reshape(batch, time, cfg.patch_d)
+        # TODO(sholto): MLP? Mini transformer?
 
     # Final layer norm.
     x = rms_norm(x, weights.gamma_final)
