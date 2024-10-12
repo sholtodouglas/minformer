@@ -38,6 +38,7 @@ ShardingRules = namedtuple(
         "key_dim",
         "ffw",
         "vocab",
+        "conv_window",
     ],
 )
 
@@ -51,6 +52,7 @@ fsdp_rules = ShardingRules(
     key_dim=None,
     ffw=None,
     vocab=None,
+    conv_window=None,
 )
 
 # Define sharding rules for model parallelism
@@ -63,6 +65,7 @@ mdl_parallel_rules = ShardingRules(
     key_dim=None,
     ffw="x",  # Shard feed-forward layer
     vocab=None,
+    conv_window=None,
 )
 
 
@@ -140,8 +143,11 @@ class Layer:
     proj: jax.Array | TensorInfo
     w1: jax.Array | TensorInfo
     w2: jax.Array | TensorInfo
-    gamma1: jax.Array | TensorInfo
-    gamma2: jax.Array | TensorInfo
+    # Extra layernorms like grok.
+    attn_in_gamma: jax.Array | TensorInfo
+    attn_out_gamma: jax.Array | TensorInfo
+    ff_in_gamma: jax.Array | TensorInfo
+    ff_out_gamma: jax.Array | TensorInfo
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -176,12 +182,22 @@ class Layer:
                 ("ffw", "d_model"),
                 jax.nn.initializers.he_normal(in_axis=1, out_axis=0),
             ),
-            gamma1=TensorInfo(
+            attn_in_gamma=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
             ),
-            gamma2=TensorInfo(
+            attn_out_gamma=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
+                ("d_model",),
+                jax.nn.initializers.constant(1.0),
+            ),
+            ff_in_gamma=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
+                ("d_model",),
+                jax.nn.initializers.constant(1.0),
+            ),
+            ff_out_gamma=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
@@ -195,13 +211,31 @@ class Weights:
     embedding: jax.Array | TensorInfo
     vocab_proj: jax.Array | TensorInfo
     gamma_final: jax.Array | TensorInfo
+    # MEGABYTE only.
+    causal_convs: list[jax.Array | TensorInfo] | None
+    mini_model: list[Layer]
 
     @classmethod
     def abstract(cls, cfg: Config):
         if cfg.mega_byte:
             embed_dim = cfg.patch_d
+            windows = [3,5,7]
+            causal_convs = [
+                TensorInfo(
+                jax.ShapeDtypeStruct((window, cfg.patch_d, cfg.patch_d), cfg.weight_dtype_at_rest),
+                ("vocab", "d_model"),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            )
+            for window in windows
+            ]
+            mini_cfg = dataclasses.replace(cfg, d_model=cfg.patch_d)
+            # 3 Little transformer layers on top!
+            mini_model = [Layer.abstract(mini_cfg) for _ in range(3)]
         else:
             embed_dim = cfg.d_model
+            causal_convs = None
+            mini_model = None
+        
 
         return Weights(
             layers=[Layer.abstract(cfg) for _ in range(cfg.num_layers)],
@@ -220,6 +254,8 @@ class Weights:
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
             ),
+            causal_convs=causal_convs,
+            mini_model=mini_model,
         )
 
     @classmethod
@@ -485,7 +521,7 @@ def forward_layer(
     # Cast layer to bfloat16 for faster operations.
     layer = jax.tree.map(lambda x: cfg.active_weight_dtype(x), layer)
     with jax.named_scope("attn_pre_norm"):
-        attn_in = rms_norm(x, layer.gamma1)
+        attn_in = rms_norm(x, layer.attn_in_gamma)
 
     # Multi-head attention
     with jax.named_scope("qkv_matmul"):
@@ -538,11 +574,12 @@ def forward_layer(
 
     # Residual connection
     with jax.named_scope("residual"):
+        attn_out = rms_norm(x, layer.attn_out_gamma)
         x = x + attn_out
 
     # Second RMSNorm (Pre-LN for FFN)
     with jax.named_scope("ffn_pre_norm"):
-        ff_in = rms_norm(x, layer.gamma2)
+        ff_in = rms_norm(x, layer.ff_in_gamma)
 
     # FFN
     with jax.named_scope("ffw"):
@@ -552,16 +589,46 @@ def forward_layer(
 
     # Residual connection
     with jax.named_scope("residual"):
+        ff_out = rms_norm(ff_out, layer.ff_out_gamma)
         x = x + ff_out
 
     return x, k, v
 
 
+def causal_conv1d(x, weight):
+    """
+    Perform causal 1D convolution over the 'patch' dimension.
+    
+    Args:
+    x: input of shape (batch_size, time, patch, in_channels)
+    weight: convolution kernel of shape (kernel_size, in_channels, out_channels)
+    
+    Returns:
+    Output of shape (batch_size, time, patch, out_channels)
+    """
+    kernel_size, _, out_channels = weight.shape
+    
+    # Pad the input to maintain the output size
+    padded_x = jnp.pad(x, ((0, 0), (kernel_size - 1, 0), (0, 0)))
+    
+    # Perform convolution
+    out = jax.lax.conv_general_dilated(
+        lhs=padded_x,
+        rhs=weight,
+        window_strides=(1,),
+        padding='VALID',
+        dimension_numbers=('NHC', 'HIO', 'NHC')
+    )
+
+    
+    return out
+
 def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None):
 
     internals = {}
     # Embed input tokens [B, T] -> [B, T D]
-    x = weights.embedding[x, :]
+    embeds = weights.embedding[x, :]
+    x = embeds
     batch, time = x.shape[0], x.shape[1]
     # To reduce attention cost, we can do something like MEGABYTE.
     if cfg.mega_byte:
@@ -571,14 +638,17 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
         x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
         # Sub sampling segment ids will work because they are padded to multiples of patch
         # size.
-        # TODO(sholto): Do a causal conv over patch instead.
+        x = x.reshape(-1, cfg.patch_size, cfg.patch_d)
+        for filter in weights.causal_convs:
+            x = causal_conv1d(x, filter)
+        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
         x = x.reshape(batch, time//cfg.patch_size, cfg.d_model)
-        segment_ids = segment_ids[:, ::cfg.patch_size]
-        assert x.shape[1] == segment_ids.shape[1]
-    # Reshape sequence to [B, T/patch_size, patch_size, patch_D]
-    # Run a causal conv over each patch to give local contextual information.
-    # We then also need to subsample segment_ids to get the right positions.
-    positions = segment_ids_to_positions(segment_ids)
+        main_block_segment_ids = segment_ids[:, ::cfg.patch_size]
+        positions = segment_ids_to_positions(main_block_segment_ids)
+        assert x.shape[1] == main_block_segment_ids.shape[1]
+    else:
+        positions = segment_ids_to_positions(segment_ids)
+        main_block_segment_ids = segment_ids
     # Apply rotary embeddings: [B, T, head_dim]
     if cache is not None:
         # For inference with cache, we need to index the positional embeddings
@@ -591,7 +661,7 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     sin, cos = _generate_pos_embeddings(positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
 
     for idx, layer in enumerate(weights.layers):
-        x, k, v = forward_layer(x, segment_ids, layer, sin, cos, idx, cfg, cache)
+        x, k, v = forward_layer(x, main_block_segment_ids, layer, sin, cos, idx, cfg, cache)
         if cache is not None:
             cache.k[idx] = k
             cache.v[idx] = v
@@ -599,9 +669,25 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     # At this point, if we are MEGABYTE:
     # We have shape [B, T//patch_size, D]
     if cfg.mega_byte:
+        # In effect, run a tiny transformer with a way bigger batch dim (i.e. we just want to do patch size tokens at once).
+        # We don't need a cache here since this will be patch specific, and at inference time we make one patch per step.
+        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        prev_token_embeds = embeds[:, :-1, :]
+        prev_token_embeds = jnp.concatenate([jnp.zeros_like(embeds[:, 0:1, :]), prev_token_embeds], axis=1)
+        prev_token_embeds = prev_token_embeds.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        x = x + prev_token_embeds
+        x = x.reshape(-1, cfg.patch_size, cfg.patch_d)
+        per_patch_segment_ids = segment_ids.reshape(batch, time//cfg.patch_size, cfg.patch_size)
+        per_patch_segment_ids = per_patch_segment_ids.reshape(-1, cfg.patch_size)
+        positions = segment_ids_to_positions(segment_ids)
+        per_patch_positions = positions.reshape(batch, time//cfg.patch_size, cfg.patch_size)
+        per_patch_positions = positions.reshape(-1, cfg.patch_size)
+        sin, cos = _generate_pos_embeddings(per_patch_positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
+        mini_model_cfg = dataclasses.replace(cfg, use_attn_kernel=False)
+        for idx, layer in enumerate(weights.mini_model):
+            x, _, _ = forward_layer(x, per_patch_segment_ids, layer, sin, cos, idx, mini_model_cfg, None)
         x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
         x = x.reshape(batch, time, cfg.patch_d)
-        # TODO(sholto): MLP? Mini transformer?
 
     # Final layer norm.
     x = rms_norm(x, weights.gamma_final)

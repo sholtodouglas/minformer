@@ -107,6 +107,8 @@ def main():
         min_lr=args.min_lr,
         warmup_steps=args.warmup_steps,
         total_steps=args.total_steps,
+        # mega_byte=True,
+        # patch_size=8,
     )
 
     # Print the config to verify all parameters are set correctly
