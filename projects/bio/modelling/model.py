@@ -112,6 +112,8 @@ class Config:
     # Predict on final step.
     # Occasionally we'll want to predict some continuous values - like categories.
     predict_on_final_step: bool = False
+    # BERT
+    mask_token: int | None = None
 
     @property
     def patch_d(self):
@@ -126,7 +128,8 @@ class TensorInfo:
     metadata: dict = field(default_factory=dict)
 
 
-def process_batch(batch, cfg):
+def process_batch(batch, cfg, step_idx: int | None = None):
+    del step_idx
     batch_size = batch["x"].shape[0]
     # Patch size lets us handle megabyte style methods to reduce effective seqlen.
     # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
@@ -139,22 +142,39 @@ def process_batch(batch, cfg):
         "aux": None,
     }
 
-def process_batch_shae(batch, cfg):
+def process_batch_shae(batch, cfg, step_idx: int | None = None):
     batch_size = batch["x"].shape[0]
-    # Patch size lets us handle megabyte style methods to reduce effective seqlen.
-    # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
-    dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
-    return {
-        "x": np.concatenate([batch["x"][:, :-cfg.patch_size], dummy], axis=-1),
-        "y": np.concatenate([batch["x"][:, cfg.patch_size:], dummy], axis=-1),
-        # TODO(sholto): Maybe we should padd in dataset so we are't attending to next seq.
-        "segment_ids": np.concatenate([batch["segment_ids"][:, :-cfg.patch_size], dummy], axis=-1),
-        "aux": {
+    aux = {
             "lad_category": batch["lad_category"],
             "lad_value": batch["lad_value"],
             "sad_category": batch["sad_category"],
             "sad_value": batch["sad_value"],
-        },
+        }
+
+    if cfg.causal:
+        # Patch size lets us handle megabyte style methods to reduce effective seqlen.
+        # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
+        dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
+        x = np.concatenate([batch["x"][:, :-cfg.patch_size], dummy], axis=-1)
+        y = np.concatenate([batch["x"][:, cfg.patch_size:], dummy], axis=-1)
+        segment_ids = np.concatenate([batch["segment_ids"][:, :-cfg.patch_size], dummy], axis=-1)
+    else:
+        segment_ids = batch['segment_ids']
+        # In this case we are doing BERT.
+        bert_corruption = jax.random.randint(jax.random.key(step_idx), segment_ids.shape, 0, 100)
+        # 15 of tokens masked
+        masking = bert_corruption <= 15
+        masked_batch = jnp.where(masking, cfg.mask_token, batch['x'])
+        x = masked_batch
+        y = batch['x']
+        aux['bert_mask'] = masking
+
+
+    return {
+        "x": x,
+        "y": y,
+        "segment_ids": segment_ids,
+        "aux": aux,
     }
 
 
@@ -850,6 +870,12 @@ def compute_loss(
     logits, internals = forward(x, segment_ids, weights, cfg, aux=aux)
     # Important assumption that segment_ids 0 is 'padding'.
     loss_mask = jnp.where(segment_ids == 0, 0, 1)
+    if not cfg.causal:
+        assert 'bert_mask' in aux
+        # Only count the loss for tokens that were masked in BERT.
+        loss_mask &= aux['bert_mask']
+
+        
     loss, accuracy, internals = cross_entropy_loss(logits, y, loss_mask, internals)
     internals['token_prediction_loss'] = loss
     # TODO(sholto):

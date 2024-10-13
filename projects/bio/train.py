@@ -169,7 +169,7 @@ def main():
 
         for i in range(start_step, cfg.total_steps):
             next_batch = next(iter)
-            batch = process_batch(next_batch, cfg)
+            batch = process_batch(next_batch, cfg, step_idx=i)
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
             # Always profile on the first step so that we can think about optimisations.
