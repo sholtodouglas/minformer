@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import model
 import numpy as np
+import dataclasses
 
 
 def print_test_passed(test_name):
@@ -107,12 +108,20 @@ def test_attention_impl_equivalence():
     batch_size = 8
     seq_len = 128
     num_heads = 4
-    head_dim = 64
+    head_dim = 128
     d_model = num_heads * head_dim
 
     # Create a dummy config
     rules = model.ShardingRules(
-        batch="x", sequence=None, d_model="x", query_heads=None, key_heads=None, key_dim=None, ffw=None, vocab=None
+        batch="x",
+        sequence=None,
+        d_model="x",
+        query_heads=None,
+        key_heads=None,
+        key_dim=None,
+        ffw=None,
+        vocab=None,
+        conv_window=None,
     )
 
     cfg = model.Config(
@@ -153,6 +162,23 @@ def test_attention_impl_equivalence():
 
     jnp.allclose(output_attention, output_attention_kernel, atol=atol, rtol=rtol)
     print_test_passed("Kernel and manual implementation equivalence")
+
+    # Run them with sliding window.
+    sliding_window_cfg = dataclasses.replace(cfg, num_local_heads=2, local_window_size=16)
+    q_positions = jax.lax.broadcasted_iota(jnp.int32, (1, seq_len), dimension=1)
+    kv_positions = jax.lax.broadcasted_iota(jnp.int32, (1, seq_len), dimension=1)
+    local_mask = model.make_sliding_local_mask(
+            q_positions,
+            kv_positions,
+            cfg.query_heads,
+            cfg.num_local_heads,
+            cfg.local_window_size
+        )
+    output_attention = model.attention(q, k, v, segment_ids, segment_ids, q_offset, sliding_window_cfg, local_mask=local_mask)
+    output_attention_kernel = model.attention_kernel(q, k, v, segment_ids, segment_ids, sliding_window_cfg)
+
+    jnp.allclose(output_attention, output_attention_kernel, atol=atol, rtol=rtol)
+    print_test_passed("Sliding local kernel and manual implementation equivalence")
 
 
 def test_cross_entropy_loss(print_intermediates: bool = False):

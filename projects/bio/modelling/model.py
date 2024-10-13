@@ -11,7 +11,8 @@ import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from flax import struct
-from jax.experimental.pallas.ops.tpu import flash_attention
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.experimental.shard_map import shard_map
 from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
@@ -109,6 +110,14 @@ class Config:
     # MEGABYTE only https://openreview.net/pdf?id=JTmO2V9Xpz
     mega_byte: bool = False
     patch_size: int | None = 1
+    # Sparse sliding windows
+    sparse_attention: bool = False
+    sparse_window_size: int = 512
+    sets_of_heads: int = 2
+    # Local sliding window
+    num_local_heads: int = 0
+    local_window_size: int = 512
+
 
     @property
     def patch_d(self):
@@ -340,6 +349,13 @@ class KVCache:
     def time_axis(self) -> int:
         return 2
 
+    @property
+    def positions(self) -> jax.Array:
+        b = self.k[0].shape[0]
+        t = self.k[0].shape[self.time_axis]
+        return jax.lax.broadcasted_iota(jnp.int32, (b, t), dimension=1)
+
+
 
 def segment_ids_to_positions(segment_ids):
     """Counts positions for segment ids."""
@@ -422,6 +438,42 @@ def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, ca
         return segment_mask
 
 
+def make_strided_masks(q_positions, kv_positions, window_size, num_unique_heads, total_num_heads):
+    """Makes strided local bands."""
+
+    # Like mistral, but more windows not just the last N.
+    # Better convergage with longer seqlens.
+    delta = q_positions[:, :, None] - kv_positions[:, None, :]
+    seqlen = delta.shape[1]
+    masks_per_head = [jnp.zeros((seqlen, seqlen), dtype=jnp.bool) for i in range(0, num_unique_heads)]
+
+    current_head = 0
+    for windows in range(delta.shape[1] // window_size):
+        start = windows * window_size
+        end = (windows + 1) * window_size
+        sliding_band = (start < delta) & (delta < end)
+        masks_per_head[current_head] = jnp.logical_or(masks_per_head[current_head], sliding_band)
+        current_head = (current_head + 1) % num_unique_heads
+
+
+    masks_per_head = np.stack(masks_per_head, axis=1) # [batch, num_unique_heads, q_len, k_len]
+    masks_per_head = np.tile(masks_per_head, (total_num_heads // num_unique_heads, 1, 1))
+    return masks_per_head
+
+
+def make_sliding_local_mask(q_positions, kv_positions, num_heads, num_local_heads, sliding_window_size):
+    """Makes bidi sliding local window."""
+    q_positions = q_positions[:, :, None]
+    kv_positions = kv_positions[:, None, :]
+    num_global_heads = num_heads - num_local_heads
+    right = q_positions >= kv_positions - sliding_window_size
+    left = q_positions - sliding_window_size <= kv_positions
+    local_window = left & right
+    global_window = jnp.ones_like(local_window)
+    multi_head_mask = [local_window] * num_local_heads + [global_window] * num_global_heads
+    multi_head_mask = jnp.stack(multi_head_mask, axis=1)
+    return multi_head_mask
+    
 def attention(
     q: jax.Array,
     k: jax.Array,
@@ -430,6 +482,8 @@ def attention(
     k_segment_ids: jax.Array,
     q_offset: jax.Array,
     cfg: Config,
+    sparse_mask: jax.Array | None = None,
+    local_mask: jax.Array | None = None,
 ) -> jax.Array:
     """
     Compute attention.
@@ -448,11 +502,14 @@ def attention(
     """
     # Div sqrt(key_dim)
     scale = q.shape[-1] ** -0.5
-    assert q.dtype == jnp.float32
-    assert k.dtype == jnp.float32
+    q, k = q.astype(jnp.float32), k.astype(jnp.float32)
     qk = jnp.einsum("bhtd,bhTd->bhtT", q, k) * scale
     mask = make_attention_mask(q.shape[2], k.shape[2], q_segment_ids, k_segment_ids, q_offset, cfg.causal)
     # Apply the combined mask
+    if sparse_mask is not None:
+        mask = jnp.logical_and(mask, sparse_mask)
+    if local_mask is not None:
+        mask = jnp.logical_and(mask, local_mask)
     qk = jnp.where(mask, qk, -1e30)
     # Jax softmax impl includes max subtraction for numerical stability, no need to
     # do it outside.
@@ -460,7 +517,7 @@ def attention(
     return jnp.einsum("bhtT,bhTd->bhtd", attn, v).astype(jnp.bfloat16)
 
 
-def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
+def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config, sparse_mask: jax.Array | None = None):
     """Flash attention kernel!"""
 
     # On TPUv3, pallas seems to only work with float32.
@@ -481,21 +538,75 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
         check_rep=False,
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
-        segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
-                                                block_sizes=flash_attention.BlockSizes(
-                                                block_q=512,
-                                                block_k_major=512,
-                                                block_k=512,
-                                                block_b=1,
-                                                block_q_major_dkv=512,
-                                                block_k_major_dkv=512,
-                                                block_k_dkv=512,
-                                                block_q_dkv=512,
-                                                block_k_major_dq=512,
-                                                block_k_dq=512,
-                                                block_q_dq=512
-                                               ))
+        decoder_segment_ids = splash_attention_kernel.SegmentIds(q_segment_ids, kv_segment_ids)
+        q_seqlen = q.shape[2]
+        k_seqlen = k.shape[2]
+        block_sizes = splash_attention_kernel.BlockSizes(
+            block_q=min(256, q_seqlen),
+            block_kv_compute=min(256, k_seqlen),
+            block_kv=min(256, k_seqlen),
+            block_q_dkv=min(256, q_seqlen),
+            block_kv_dkv=min(256, k_seqlen),
+            block_kv_dkv_compute=min(256, q_seqlen),
+            block_q_dq=min(256, q_seqlen),
+            block_kv_dq=min(256, q_seqlen),
+        )
+        mask = splash_attention_mask.CausalMask(shape=(q_seqlen, q_seqlen))
+        # if sparse_mask is not None:
+        #     for i in range(0, len(per_head_mask)):
+        #         if i < cfg.num_local_heads:
+        #             assert sparse_mask.shape[0] == 1
+        #             # This causes smem spills.
+        #             per_head_mask[i] &= splash_attention_mask.NumpyMask(sparse_mask[0, i, :, :])
+        
+        # First up, do the local heads.
+        q = q * scale
+        # Because of the insane smem spills, we have to do this terrible split / combine, instead of
+        # just having seperate masks.
+        if cfg.num_local_heads:
+            with jax.named_scope('local_kernel'):
+                q_local = q[:, :cfg.num_local_heads, :, :]
+                k_local = k[:, :cfg.num_local_heads, :, :]
+                v_local = v[:, :cfg.num_local_heads, :, :]
+                local_mask =  mask & splash_attention_mask.LocalMask(
+                    shape=(q.shape[2], q.shape[2]),
+                    window_size=(cfg.local_window_size, cfg.local_window_size),
+                    offset=0,
+                )
+                local_mask = splash_attention_mask.MultiHeadMask(masks=(local_mask,) * cfg.num_local_heads)
+                local_splash_kernel = splash_attention_kernel.make_splash_mha(
+                    mask=local_mask,
+                    head_shards=1,
+                    q_seq_shards=1,
+                    block_sizes=block_sizes,
+                    attn_logits_soft_cap=None,
+                )
+                local_out = jax.vmap(local_splash_kernel)(q_local, k_local, v_local, segment_ids=decoder_segment_ids)
+            with jax.named_scope('global_kernel'):
+                q_global = q[:, cfg.num_local_heads:, :, :]
+                k_global = k[:, cfg.num_local_heads:, :, :]
+                v_global = v[:, cfg.num_local_heads:, :, :]
+                global_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * q_global.shape[1])
+                global_splash_kernel = splash_attention_kernel.make_splash_mha(
+                    mask=global_mask,
+                    head_shards=1,
+                    q_seq_shards=1,
+                    block_sizes=block_sizes,
+                    attn_logits_soft_cap=None,
+                )
+                global_out = jax.vmap(global_splash_kernel)(q_global, k_global, v_global, segment_ids=decoder_segment_ids)
+                out = jnp.concatenate([local_out, global_out], axis=1)
+        else:
+            multi_head_mask = splash_attention_mask.MultiHeadMask(masks=(mask,) * q.shape[1])
+            splash_kernel = splash_attention_kernel.make_splash_mha(
+                mask=multi_head_mask,
+                head_shards=1,
+                q_seq_shards=1,
+                block_sizes=block_sizes,
+                attn_logits_soft_cap=None,
+            )
+            out = jax.vmap(splash_kernel)(q, k, v, segment_ids=decoder_segment_ids)
+        return out
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
@@ -515,6 +626,8 @@ def forward_layer(
     idx: int,
     cfg: Config,
     cache: KVCache | None = None,
+    sparse_mask: jax.Array | None = None,
+    local_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # First RMSNorm (Pre-LN for attention)
 
@@ -564,9 +677,10 @@ def forward_layer(
         if cfg.use_attn_kernel:
             if cache is not None:
                 raise ValueError("Kernel is only for training.")
-            attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
+            # Attention kernel does not need a mask for local.
+            attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg, sparse_mask)
         else:
-            attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg)
+            attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg, sparse_mask, local_mask)
 
     # Project attention output
     with jax.named_scope("projection"):
@@ -574,7 +688,7 @@ def forward_layer(
 
     # Residual connection
     with jax.named_scope("residual"):
-        attn_out = rms_norm(x, layer.attn_out_gamma)
+        attn_out = rms_norm(attn_out, layer.attn_out_gamma)
         x = x + attn_out
 
     # Second RMSNorm (Pre-LN for FFN)
@@ -623,7 +737,11 @@ def causal_conv1d(x, weight):
     
     return out
 
-def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None):
+def forward(x: jax.Array,
+            segment_ids: jax.Array,
+            weights: Weights,
+            cfg: Config,
+            cache: KVCache | None = None):
 
     internals = {}
     # Embed input tokens [B, T] -> [B, T D]
@@ -659,9 +777,38 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     positions = start_indices[:, None] + positions
     # [B, T, head_dim]
     sin, cos = _generate_pos_embeddings(positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
+    q_positions = positions
+    kv_positions = positions if cache is None else cache.positions
+    if cfg.sparse_attention:
+        if cache is None:
+            # Don't need the batch dimension during training, no need to consume
+            # extra memory!
+            q_positions, kv_positions = q_positions[0:1, :, :, :], kv_positions[0:1, :, :, :]
+        else:
+            if cfg.use_attn_kernel:
+                raise NotImplementedError("Unclear how to provide different batch dims in splash.")
+        sparse_mask = make_strided_masks(q_positions,
+                                         kv_positions,
+                                         window_size=cfg.sparse_window_size,
+                                         num_unique_heads=cfg.query_heads // cfg.sets_of_heads,
+                                         total_num_heads=cfg.query_heads)
+    else:
+        sparse_mask = None
+    if cfg.num_local_heads > 0 and not cfg.use_attn_kernel:
+        local_mask = make_sliding_local_mask(
+            q_positions,
+            kv_positions,
+            cfg.num_heads,
+            cfg.num_local_heads,
+            cfg.local_window_size
+        )
+    else:
+        local_mask = None
+
+
 
     for idx, layer in enumerate(weights.layers):
-        x, k, v = forward_layer(x, main_block_segment_ids, layer, sin, cos, idx, cfg, cache)
+        x, k, v = forward_layer(x, main_block_segment_ids, layer, sin, cos, idx, cfg, cache, sparse_mask, local_mask)
         if cache is not None:
             cache.k[idx] = k
             cache.v[idx] = v
