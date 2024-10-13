@@ -574,7 +574,7 @@ def forward_layer(
 
     # Residual connection
     with jax.named_scope("residual"):
-        attn_out = rms_norm(x, layer.attn_out_gamma)
+        attn_out = rms_norm(attn_out, layer.attn_out_gamma)
         x = x + attn_out
 
     # Second RMSNorm (Pre-LN for FFN)
