@@ -4,6 +4,7 @@
 For open genome:
 
 python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v3/ --log_every=10
+python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=1000 --max_seq_len=8192 --data_dir=gs://minformer_data/shae_8k/tfrecords/ --dataset=shae_8k --log_every=10
 
 """
 import argparse
@@ -21,6 +22,7 @@ import numpy as np
 from tensorboardX import SummaryWriter
 from jax.profiler import trace
 import data_hf
+import data_shae
 
 
 def parse_args():
@@ -33,16 +35,16 @@ def parse_args():
     parser.add_argument("--key_dim", type=int, default=128, help="Key dimension")
     parser.add_argument("--vocab_size", type=int, default=8, help="Vocabulary size")
     parser.add_argument("--max_seq_len", type=int, default=16384, help="Maximum sequence length")
-    parser.add_argument("--max_lr", type=float, default=3e-4, help="Maximum learning rate")
+    parser.add_argument("--max_lr", type=float, default=1e-4, help="Maximum learning rate")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--warmup_steps", type=int, default=50, help="Number of warmup steps")
     parser.add_argument("--total_steps", type=int, default=100000, help="Total number of training steps")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
     parser.add_argument(
-        "--log_dir", type=str, default="/tmp/logs/plasmid", help="Base directory for TensorBoard logs"
+        "--log_dir", type=str, default="/tmp/logs/shae", help="Base directory for TensorBoard logs"
     )
     parser.add_argument(
         "--checkpoint_dir", type=str, default="/tmp/dna_checkpoints", help="Directory for saving checkpoints"
@@ -50,6 +52,13 @@ def parse_args():
     parser.add_argument("--checkpoint_interval", type=int, default=1000, help="Save checkpoint every N steps")
     parser.add_argument(
         "--resume_from_checkpoint", action="store_true", help="Resume training from the latest checkpoint"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["human-genome-8192", "open-genome-imgpr", "shae_8k"],
+        default="open-genome-imgpr",
+        help="Type of dataset to download and process",
     )
     return parser.parse_args()
 
@@ -85,7 +94,12 @@ def main():
 
     # Data setup
     # TODO: Configure.
-    iter = data_hf.create_iterator(str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True)
+    if args.dataset == "open-genome-imgpr":
+        iter = data_hf.create_iterator(str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True)
+        process_batch = model.process_batch
+    elif args.dataset == "shae_8k":
+        iter = data_shae.create_iterator(str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True)
+        process_batch = model.process_batch_shae
 
     # Model configuration
     cfg = model.Config(
@@ -154,19 +168,22 @@ def main():
         )
 
         for i in range(start_step, cfg.total_steps):
-            batch = model.process_batch(next(iter), cfg)
+            next_batch = next(iter)
+            batch = process_batch(next_batch, cfg)
             batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
             # Always profile on the first step so that we can think about optimisations.
             if i == 0:
                 with trace(log_dir):
                     loss, weights, opt_state, internals = step(
-                        weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
+                        weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i,
+                        aux=batch['aux'],
                     )
                     jax.block_until_ready(loss)
             else:
                 loss, weights, opt_state, internals = step(
-                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i
+                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i,
+                    aux=batch["aux"]
                 )
 
             if i % args.log_every == 0:

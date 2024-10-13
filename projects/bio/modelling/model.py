@@ -109,6 +109,9 @@ class Config:
     # MEGABYTE only https://openreview.net/pdf?id=JTmO2V9Xpz
     mega_byte: bool = False
     patch_size: int | None = 1
+    # Predict on final step.
+    # Occasionally we'll want to predict some continuous values - like categories.
+    predict_on_final_step: bool = False
 
     @property
     def patch_d(self):
@@ -133,7 +136,27 @@ def process_batch(batch, cfg):
         "y": np.concatenate([batch["x"][:, cfg.patch_size:], dummy], axis=-1),
         # TODO(sholto): Maybe we should padd in dataset so we are't attending to next seq.
         "segment_ids": np.concatenate([batch["segment_ids"][:, :-cfg.patch_size], dummy], axis=-1),
+        "aux": None,
     }
+
+def process_batch_shae(batch, cfg):
+    batch_size = batch["x"].shape[0]
+    # Patch size lets us handle megabyte style methods to reduce effective seqlen.
+    # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
+    dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
+    return {
+        "x": np.concatenate([batch["x"][:, :-cfg.patch_size], dummy], axis=-1),
+        "y": np.concatenate([batch["x"][:, cfg.patch_size:], dummy], axis=-1),
+        # TODO(sholto): Maybe we should padd in dataset so we are't attending to next seq.
+        "segment_ids": np.concatenate([batch["segment_ids"][:, :-cfg.patch_size], dummy], axis=-1),
+        "aux": {
+            "lad_category": batch["lad_category"],
+            "lad_value": batch["lad_value"],
+            "sad_category": batch["sad_category"],
+            "sad_value": batch["sad_value"],
+        },
+    }
+
 
 @struct.dataclass
 class Layer:
@@ -214,6 +237,14 @@ class Weights:
     # MEGABYTE only.
     causal_convs: list[jax.Array | TensorInfo] | None
     mini_model: list[Layer]
+    # For predicting LADs
+    lad_hidden: jax.Array
+    lad_predictor: jax.Array
+    lad_regressor: jax.Array
+    sad_hidden: jax.Array
+    sad_predictor: jax.Array
+    sad_regressor: jax.Array
+
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -256,6 +287,37 @@ class Weights:
             ),
             causal_convs=causal_convs,
             mini_model=mini_model,
+            lad_hidden=TensorInfo(
+                jax.ShapeDtypeStruct((embed_dim, embed_dim), cfg.weight_dtype_at_rest),
+                ("d_model", "ffw"),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            ),
+            lad_predictor=TensorInfo(
+                jax.ShapeDtypeStruct((embed_dim, 3), cfg.weight_dtype_at_rest),
+                ("d_model", "ffw"),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            ),
+            lad_regressor=TensorInfo(
+                jax.ShapeDtypeStruct((embed_dim, 1), cfg.weight_dtype_at_rest),
+                ("d_model", "ffw"),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            ),
+            sad_hidden=TensorInfo(
+                jax.ShapeDtypeStruct((embed_dim, embed_dim), cfg.weight_dtype_at_rest),
+                ("d_model", "ffw"),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            ),
+            sad_predictor=TensorInfo(
+                jax.ShapeDtypeStruct((embed_dim, 3), cfg.weight_dtype_at_rest),
+                ("d_model", "ffw"),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            ),
+            sad_regressor=TensorInfo(
+                jax.ShapeDtypeStruct((embed_dim, 1), cfg.weight_dtype_at_rest),
+                ("d_model", "ffw"),
+                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            ),
+
         )
 
     @classmethod
@@ -623,7 +685,8 @@ def causal_conv1d(x, weight):
     
     return out
 
-def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None):
+def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None, *,
+            aux: Any | None = None,):
 
     internals = {}
     # Embed input tokens [B, T] -> [B, T D]
@@ -693,6 +756,21 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     x = rms_norm(x, weights.gamma_final)
     # Project to vocabulary size
     logits = jnp.einsum("btd,dv->btv", x, weights.vocab_proj)
+
+    # If we have aux to predict (i.e. laminar associated domains, do so):
+    if aux is not None:
+        last_nonzero = jnp.sum(segment_ids > 0, axis=-1)
+        indices = last_nonzero[:, None, None]
+        last_xs = jnp.take_along_axis(x, indices, 1)
+        assert last_xs.shape[1] == 1
+        lad = jax.nn.gelu(jnp.einsum('btd,df->btf', last_xs, weights.lad_hidden))
+        internals['lad_pred'] = jnp.einsum('btf,fv', lad, weights.lad_predictor)[:, 0, :] # [B, 3]
+        internals['lad_reg'] = jnp.einsum('btf,fv', lad, weights.lad_regressor)[:, 0, 0] # [B]
+        sad = jax.nn.gelu(jnp.einsum('btd,df->btf', last_xs, weights.sad_hidden))
+        internals['sad_pred'] = jnp.einsum('btf,fv', sad, weights.sad_predictor)[:, 0, :] # [B, 3]
+        internals['sad_reg'] = jnp.einsum('btf,fv', sad, weights.sad_regressor)[:, 0, 0] # [B]
+
+
     if cache is not None:
         # Sum where there is a valid segment id (i.e. non padding tokens) [B, T] -> [B,]
         cache = dataclasses.replace(cache, lengths=cache.lengths + jnp.sum(segment_ids != 0, axis=-1))
@@ -766,12 +844,26 @@ def cross_entropy_loss(
 
 
 def compute_loss(
-    weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, cfg: Config
+    weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, cfg: Config,
+    aux: Any | None = None,
 ) -> tuple[jax.Array, Any]:
-    logits, internals = forward(x, segment_ids, weights, cfg)
+    logits, internals = forward(x, segment_ids, weights, cfg, aux=aux)
     # Important assumption that segment_ids 0 is 'padding'.
     loss_mask = jnp.where(segment_ids == 0, 0, 1)
     loss, accuracy, internals = cross_entropy_loss(logits, y, loss_mask, internals)
+    internals['token_prediction_loss'] = loss
+    # TODO(sholto):
+    # CE for lad/sad_pred. MSE for lad/sad_regress.
+    if aux is not None:
+        aux_mask = jnp.ones_like(aux['lad_category']) # [B]
+        lad_ce, lad_acc = cross_entropy_loss(internals['lad_pred'], aux['lad_category'], aux_mask,)
+        sad_ce, sad_acc = cross_entropy_loss(internals['sad_pred'], aux['sad_category'], aux_mask,)
+        lad_mse = (internals['lad_reg'] - aux['lad_value']) ** 2
+        sad_mse = (internals['sad_reg'] - aux['sad_value']) ** 2
+        (internals['lad_ce'], internals['lad_acc'], internals['sad_ce'],
+          internals['sad_acc'], internals['lad_mse'], internals['sad_mse']) = (lad_ce, lad_acc, sad_ce,
+                                                                                sad_acc, lad_mse, sad_mse)
+
     internals["accuracy"] = accuracy
     return loss, internals
 
@@ -797,9 +889,10 @@ def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: i
 
 
 def update_step(
-    weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, opt_state: Any, step: int, cfg: Config
+    weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, opt_state: Any, step: int, cfg: Config,
+    aux: Any | None,
 ):
-    (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg)
+    (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg, aux)
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
     weights, opt_state, internals = update_weights(weights, grads, opt_state, lr, step, cfg, internals)
     internals["lr"] = lr
@@ -814,7 +907,9 @@ def input_shardings(
         "segment_ids": P("batch", "sequence"),
         "y": P("batch", "sequence"),
     }
-    return jax.tree.map(partial(_logical_to_sharding, mesh=mesh, rules=rules), logical_axes)
+    physical_axes = jax.tree.map(partial(_logical_to_sharding, mesh=mesh, rules=rules), logical_axes)
+    physical_axes["aux"] = None
+    return physical_axes
 
 
 # Checkpointing logic
