@@ -291,7 +291,7 @@ def test_overtrain_and_sample_simple_sequence():
         mesh=model.create_mesh(),
     )
     weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
-    opt_state = model.init_adam_state(weights)
+    opt_state = model.init_optimizer_state(weights)
     step = jax.jit(model.update_step, static_argnames="cfg")
     step = functools.partial(step, cfg=cfg)
 
@@ -305,7 +305,7 @@ def test_overtrain_and_sample_simple_sequence():
     batch = jax.device_put(batch, model.input_shardings(cfg.mesh, cfg.rules))
 
     ckpt_path = "/tmp/test_dir"
-    ckpt_manager = model.make_mgnr(path=ckpt_path, erase=True)
+    ckpt_manager = model.make_mngr(path=ckpt_path, erase=True)
 
     losses = []
     for s in range(0, 50):

@@ -8,16 +8,16 @@ python3 projects/bio/download_data.py --dataset shae_8k --use-gcs --bucket-name 
 """
 
 import argparse
+import io
 import os
 import urllib.request
-from google.cloud import storage
-import pandas as pd
 
 import data
 import data_hf
 import data_shae
-import io
+import pandas as pd
 from datasets import load_dataset
+from google.cloud import storage
 
 
 def parse_args():
@@ -59,12 +59,13 @@ def load_csv_from_gcp_bucket(bucket_name, file_name):
     data = blob.download_as_string()
 
     # Convert the string to a file-like object
-    data_file = io.StringIO(data.decode('utf-8'))
+    data_file = io.StringIO(data.decode("utf-8"))
 
     # Read the CSV file into a pandas DataFrame
     df = pd.read_csv(data_file)
 
     return df
+
 
 def main():
     args = parse_args()
@@ -107,17 +108,19 @@ def main():
             "LongSafari/open-genome", name="stage1", cache_dir=data_dir, data_files=data_files, num_proc=8
         )
         data_hf.process_and_save_tfrecords(
-            hf_ds["train"], os.path.join(output_dir, "stage1/train_v3"), sequence_length=args.sequence_length,
+            hf_ds["train"],
+            os.path.join(output_dir, "stage1/train_v3"),
+            sequence_length=args.sequence_length,
         )
         # data_hf.process_and_save_tfrecords(hf_ds['test'], os.path.join(output_dir, "stage1/test"), sequence_length=16384)
     elif args.dataset == "shae_8k":
-        bucket_name = 'minformer_data'
-        file_name = 'genomic_bins/8kb_genomic_bins_with_sequences_GW17IPC.csv'
+        bucket_name = "minformer_data"
+        file_name = "genomic_bins/8kb_genomic_bins_with_sequences_GW17IPC.csv"
         print("Loading csv - takes two minutes.")
         df = load_csv_from_gcp_bucket(bucket_name, file_name)
         output_dir = f"gs://{args.bucket_name}/{args.dataset}/tfrecords/"
         data_shae.process_rows(df, output_dir=output_dir)
-        
+
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
     print("Packed records created successfully.")

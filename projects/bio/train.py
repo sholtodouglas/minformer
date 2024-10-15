@@ -7,6 +7,7 @@ python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --c
 python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=1000 --max_seq_len=8192 --data_dir=gs://minformer_data/shae_8k/tfrecords/ --dataset=shae_8k --log_every=10
 
 """
+
 import argparse
 import functools
 import os
@@ -15,14 +16,14 @@ from typing import Any
 
 # Assuming these are in the same directory or in the Python path
 import data
+import data_hf
+import data_shae
 import jax
 import jax.numpy as jnp
 import modelling.model as model
 import numpy as np
-from tensorboardX import SummaryWriter
 from jax.profiler import trace
-import data_hf
-import data_shae
+from tensorboardX import SummaryWriter
 
 
 def parse_args():
@@ -43,9 +44,7 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
-    parser.add_argument(
-        "--log_dir", type=str, default="/tmp/logs/shae", help="Base directory for TensorBoard logs"
-    )
+    parser.add_argument("--log_dir", type=str, default="/tmp/logs/shae", help="Base directory for TensorBoard logs")
     parser.add_argument(
         "--checkpoint_dir", type=str, default="/tmp/dna_checkpoints", help="Directory for saving checkpoints"
     )
@@ -61,7 +60,6 @@ def parse_args():
         help="Type of dataset to download and process",
     )
     return parser.parse_args()
-
 
 
 def clean_key(key):
@@ -95,10 +93,14 @@ def main():
     # Data setup
     # TODO: Configure.
     if args.dataset == "open-genome-imgpr":
-        iter = data_hf.create_iterator(str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True)
+        iter = data_hf.create_iterator(
+            str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True
+        )
         process_batch = model.process_batch
     elif args.dataset == "shae_8k":
-        iter = data_shae.create_iterator(str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True)
+        iter = data_shae.create_iterator(
+            str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True
+        )
         process_batch = model.process_batch_shae
 
     # Model configuration
@@ -131,7 +133,7 @@ def main():
         print(f"{field}: {getattr(cfg, field)}")
 
     # Checkpoint manager setup
-    ckpt_manager = model.make_mgnr(path=args.checkpoint_dir)
+    ckpt_manager = model.make_mngr(path=args.checkpoint_dir)
 
     # Initialize or load weights and optimizer state
     if args.resume_from_checkpoint:
@@ -141,7 +143,7 @@ def main():
     else:
         print("Initializing new weights...")
         weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
-        opt_state = model.init_adam_state(weights)
+        opt_state = model.init_optimizer_state(weights)
         start_step = 0
 
     # JIT-compile the update step
@@ -176,26 +178,30 @@ def main():
             if i == 0:
                 with trace(log_dir):
                     loss, weights, opt_state, internals = step(
-                        weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i,
-                        aux=batch['aux'],
+                        weights,
+                        batch["x"],
+                        batch["segment_ids"],
+                        batch["y"],
+                        opt_state,
+                        i,
+                        aux=batch["aux"],
                     )
                     jax.block_until_ready(loss)
             else:
                 loss, weights, opt_state, internals = step(
-                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i,
-                    aux=batch["aux"]
+                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i, aux=batch["aux"]
                 )
 
             if i % args.log_every == 0:
                 # Log loss and accuracy to TensorBoard
                 writer.add_scalar("loss", loss, i)
                 writer.add_scalar("accuracy", internals["accuracy"], i)
-                writer.add_scalar("num_tokens_per_batch", np.sum(batch['segment_ids'] != 0), i)
+                writer.add_scalar("num_tokens_per_batch", np.sum(batch["segment_ids"] != 0), i)
                 print(f"Step {i}, Loss: {loss}, Accuracy: {internals['accuracy']}")
                 log_metrics(writer, internals, i)
 
             # Save checkpoint
-            if i % args.checkpoint_interval == 0 and i > 0:
+            if i > 0 and i % args.checkpoint_interval == 0:
                 print(f"Saving checkpoint at step {i}")
                 model.save(ckpt_manager, weights, opt_state, i)
 
