@@ -21,6 +21,7 @@ import utils as charformer_utils
 from tensorboardX import SummaryWriter
 
 import minformer.model as model
+import minformer.utils as utils
 
 
 def parse_args():
@@ -59,6 +60,7 @@ def parse_args():
     parser.add_argument(
         "--resume_from_checkpoint", action="store_true", help="Resume training from the latest checkpoint"
     )
+    parser.add_argument("--custom_label", type=str, default="", help="Custom label for the experiment")
     return parser.parse_args()
 
 
@@ -109,11 +111,6 @@ def eval_batch(
 def main():
     args = parse_args()
 
-    # Create a unique log directory name with key configuration parameters
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir_name = f"d{args.d_model}_l{args.num_layers}_h{args.query_heads}_lr{args.max_lr}_{timestamp}"
-    log_dir = os.path.join(args.log_dir, log_dir_name)
-
     # Data setup
     ds = data.CharDataset(data.CharDataset.get_default_config())
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -153,7 +150,7 @@ def main():
         print(f"{field}: {getattr(cfg, field)}")
 
     # Checkpoint manager setup
-    ckpt_manager = model.make_mgnr(path=args.checkpoint_dir)
+    ckpt_manager = model.make_mngr(path=args.checkpoint_dir)
 
     # Initialize or load weights and optimizer state
     if args.resume_from_checkpoint:
@@ -163,13 +160,27 @@ def main():
     else:
         print("Initializing new weights...")
         weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
-        opt_state = model.init_adam_state(weights)
+        opt_state = model.init_optimizer_state(weights)
         start_step = 0
         print("Initialization done.")
 
     # JIT-compile the update step
+    print("JIT compiling the model...")
     step = jax.jit(model.update_step, static_argnames="cfg")
     step = functools.partial(step, cfg=cfg)
+    print("JIT compilation done.")
+
+    # Create a unique log directory name with key configuration parameters
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    num_params = f"{utils.count_params(weights) / 1e6:.1f}"
+    log_dir_name = (
+        f"d{args.d_model}_l{args.num_layers}_h{args.query_heads}_{num_params}M_lr{args.max_lr}_{timestamp}"
+        + f"_{args.custom_label}"
+        if args.custom_label
+        else ""
+    )
+    log_dir = os.path.join(args.log_dir, log_dir_name)
+    print(f"Logging to {log_dir}")
 
     # Training loop
     with SummaryWriter(log_dir) as writer:
@@ -213,7 +224,7 @@ def main():
                     log_weight_histograms(writer, weights, i)
 
             # Save checkpoint
-            if i % args.checkpoint_interval == 0 and args.checkpoint_interval != -1:
+            if i > 0 and i % args.checkpoint_interval == 0 and args.checkpoint_interval != -1:
                 print(f"Saving checkpoint at step {i}")
                 model.save(ckpt_manager, weights, opt_state, i)
 

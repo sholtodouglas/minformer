@@ -9,13 +9,13 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import orbax.checkpoint as ocp
 from flax import struct
+from jax.experimental import mesh_utils
 from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
-from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
-import numpy as np
 
 
 def create_mesh():
@@ -79,7 +79,6 @@ def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRul
     return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
 
 
-
 @struct.dataclass
 class Config:
     d_model: int
@@ -135,40 +134,40 @@ def process_batch(batch, cfg, step_idx: int | None = None):
     # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
     dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
     return {
-        "x": np.concatenate([batch["x"][:, :-cfg.patch_size], dummy], axis=-1),
-        "y": np.concatenate([batch["x"][:, cfg.patch_size:], dummy], axis=-1),
+        "x": np.concatenate([batch["x"][:, : -cfg.patch_size], dummy], axis=-1),
+        "y": np.concatenate([batch["x"][:, cfg.patch_size :], dummy], axis=-1),
         # TODO(sholto): Maybe we should padd in dataset so we are't attending to next seq.
-        "segment_ids": np.concatenate([batch["segment_ids"][:, :-cfg.patch_size], dummy], axis=-1),
+        "segment_ids": np.concatenate([batch["segment_ids"][:, : -cfg.patch_size], dummy], axis=-1),
         "aux": None,
     }
+
 
 def process_batch_shae(batch, cfg, step_idx: int | None = None):
     batch_size = batch["x"].shape[0]
     aux = {
-            "lad_category": batch["lad_category"],
-            "lad_value": batch["lad_value"],
-            "sad_category": batch["sad_category"],
-            "sad_value": batch["sad_value"],
-        }
+        "lad_category": batch["lad_category"],
+        "lad_value": batch["lad_value"],
+        "sad_category": batch["sad_category"],
+        "sad_value": batch["sad_value"],
+    }
 
     if cfg.causal:
         # Patch size lets us handle megabyte style methods to reduce effective seqlen.
         # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
         dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
-        x = np.concatenate([batch["x"][:, :-cfg.patch_size], dummy], axis=-1)
-        y = np.concatenate([batch["x"][:, cfg.patch_size:], dummy], axis=-1)
-        segment_ids = np.concatenate([batch["segment_ids"][:, :-cfg.patch_size], dummy], axis=-1)
+        x = np.concatenate([batch["x"][:, : -cfg.patch_size], dummy], axis=-1)
+        y = np.concatenate([batch["x"][:, cfg.patch_size :], dummy], axis=-1)
+        segment_ids = np.concatenate([batch["segment_ids"][:, : -cfg.patch_size], dummy], axis=-1)
     else:
-        segment_ids = batch['segment_ids']
+        segment_ids = batch["segment_ids"]
         # In this case we are doing BERT.
         bert_corruption = jax.random.randint(jax.random.key(step_idx), segment_ids.shape, 0, 100)
         # 15 of tokens masked
         masking = bert_corruption <= 15
-        masked_batch = jnp.where(masking, cfg.mask_token, batch['x'])
+        masked_batch = jnp.where(masking, cfg.mask_token, batch["x"])
         x = masked_batch
-        y = batch['x']
-        aux['bert_mask'] = masking
-
+        y = batch["x"]
+        aux["bert_mask"] = masking
 
     return {
         "x": x,
@@ -265,19 +264,18 @@ class Weights:
     sad_predictor: jax.Array
     sad_regressor: jax.Array
 
-
     @classmethod
     def abstract(cls, cfg: Config):
         if cfg.mega_byte:
             embed_dim = cfg.patch_d
-            windows = [3,5,7]
+            windows = [3, 5, 7]
             causal_convs = [
                 TensorInfo(
-                jax.ShapeDtypeStruct((window, cfg.patch_d, cfg.patch_d), cfg.weight_dtype_at_rest),
-                ("vocab", "d_model"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-            )
-            for window in windows
+                    jax.ShapeDtypeStruct((window, cfg.patch_d, cfg.patch_d), cfg.weight_dtype_at_rest),
+                    ("vocab", "d_model"),
+                    jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+                )
+                for window in windows
             ]
             mini_cfg = dataclasses.replace(cfg, d_model=cfg.patch_d)
             # 3 Little transformer layers on top!
@@ -286,7 +284,6 @@ class Weights:
             embed_dim = cfg.d_model
             causal_convs = None
             mini_model = None
-        
 
         return Weights(
             layers=[Layer.abstract(cfg) for _ in range(cfg.num_layers)],
@@ -337,7 +334,6 @@ class Weights:
                 ("d_model", "ffw"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
-
         )
 
     @classmethod
@@ -564,20 +560,27 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
-                                                block_sizes=flash_attention.BlockSizes(
-                                                block_q=512,
-                                                block_k_major=512,
-                                                block_k=512,
-                                                block_b=1,
-                                                block_q_major_dkv=512,
-                                                block_k_major_dkv=512,
-                                                block_k_dkv=512,
-                                                block_q_dkv=512,
-                                                block_k_major_dq=512,
-                                                block_k_dq=512,
-                                                block_q_dq=512
-                                               ))
+        return flash_attention.flash_attention(
+            q,
+            k,
+            v,
+            segment_ids=segment_ids,
+            causal=True,
+            sm_scale=scale,
+            block_sizes=flash_attention.BlockSizes(
+                block_q=512,
+                block_k_major=512,
+                block_k=512,
+                block_b=1,
+                block_q_major_dkv=512,
+                block_k_major_dkv=512,
+                block_k_dkv=512,
+                block_q_dkv=512,
+                block_k_major_dq=512,
+                block_k_dq=512,
+                block_q_dq=512,
+            ),
+        )
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
@@ -680,33 +683,36 @@ def forward_layer(
 def causal_conv1d(x, weight):
     """
     Perform causal 1D convolution over the 'patch' dimension.
-    
+
     Args:
     x: input of shape (batch_size, time, patch, in_channels)
     weight: convolution kernel of shape (kernel_size, in_channels, out_channels)
-    
+
     Returns:
     Output of shape (batch_size, time, patch, out_channels)
     """
     kernel_size, _, out_channels = weight.shape
-    
+
     # Pad the input to maintain the output size
     padded_x = jnp.pad(x, ((0, 0), (kernel_size - 1, 0), (0, 0)))
-    
+
     # Perform convolution
     out = jax.lax.conv_general_dilated(
-        lhs=padded_x,
-        rhs=weight,
-        window_strides=(1,),
-        padding='VALID',
-        dimension_numbers=('NHC', 'HIO', 'NHC')
+        lhs=padded_x, rhs=weight, window_strides=(1,), padding="VALID", dimension_numbers=("NHC", "HIO", "NHC")
     )
 
-    
     return out
 
-def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config, cache: KVCache | None = None, *,
-            aux: Any | None = None,):
+
+def forward(
+    x: jax.Array,
+    segment_ids: jax.Array,
+    weights: Weights,
+    cfg: Config,
+    cache: KVCache | None = None,
+    *,
+    aux: Any | None = None,
+):
 
     internals = {}
     # Embed input tokens [B, T] -> [B, T D]
@@ -718,15 +724,15 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
         # Assume in this scenario embedding D is much smaller, lets call it patch_D.
         assert x.shape[-1] == cfg.patch_d
         # [B,T,patch_d] -> [B, T//patch_size, patch_size, patch_d]
-        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
         # Sub sampling segment ids will work because they are padded to multiples of patch
         # size.
         x = x.reshape(-1, cfg.patch_size, cfg.patch_d)
         for filter in weights.causal_convs:
             x = causal_conv1d(x, filter)
-        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
-        x = x.reshape(batch, time//cfg.patch_size, cfg.d_model)
-        main_block_segment_ids = segment_ids[:, ::cfg.patch_size]
+        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        x = x.reshape(batch, time // cfg.patch_size, cfg.d_model)
+        main_block_segment_ids = segment_ids[:, :: cfg.patch_size]
         positions = segment_ids_to_positions(main_block_segment_ids)
         assert x.shape[1] == main_block_segment_ids.shape[1]
     else:
@@ -754,22 +760,24 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
     if cfg.mega_byte:
         # In effect, run a tiny transformer with a way bigger batch dim (i.e. we just want to do patch size tokens at once).
         # We don't need a cache here since this will be patch specific, and at inference time we make one patch per step.
-        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
         prev_token_embeds = embeds[:, :-1, :]
         prev_token_embeds = jnp.concatenate([jnp.zeros_like(embeds[:, 0:1, :]), prev_token_embeds], axis=1)
-        prev_token_embeds = prev_token_embeds.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        prev_token_embeds = prev_token_embeds.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
         x = x + prev_token_embeds
         x = x.reshape(-1, cfg.patch_size, cfg.patch_d)
-        per_patch_segment_ids = segment_ids.reshape(batch, time//cfg.patch_size, cfg.patch_size)
+        per_patch_segment_ids = segment_ids.reshape(batch, time // cfg.patch_size, cfg.patch_size)
         per_patch_segment_ids = per_patch_segment_ids.reshape(-1, cfg.patch_size)
         positions = segment_ids_to_positions(segment_ids)
-        per_patch_positions = positions.reshape(batch, time//cfg.patch_size, cfg.patch_size)
+        per_patch_positions = positions.reshape(batch, time // cfg.patch_size, cfg.patch_size)
         per_patch_positions = positions.reshape(-1, cfg.patch_size)
-        sin, cos = _generate_pos_embeddings(per_patch_positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
+        sin, cos = _generate_pos_embeddings(
+            per_patch_positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len
+        )
         mini_model_cfg = dataclasses.replace(cfg, use_attn_kernel=False)
         for idx, layer in enumerate(weights.mini_model):
             x, _, _ = forward_layer(x, per_patch_segment_ids, layer, sin, cos, idx, mini_model_cfg, None)
-        x = x.reshape(batch, time//cfg.patch_size, cfg.patch_size, cfg.patch_d)
+        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
         x = x.reshape(batch, time, cfg.patch_d)
 
     # Final layer norm.
@@ -783,13 +791,12 @@ def forward(x: jax.Array, segment_ids: jax.Array, weights: Weights, cfg: Config,
         indices = last_nonzero[:, None, None]
         last_xs = jnp.take_along_axis(x, indices, 1)
         assert last_xs.shape[1] == 1
-        lad = jax.nn.gelu(jnp.einsum('btd,df->btf', last_xs, weights.lad_hidden))
-        internals['lad_pred'] = jnp.einsum('btf,fv', lad, weights.lad_predictor)[:, 0, :] # [B, 3]
-        internals['lad_reg'] = jnp.einsum('btf,fv', lad, weights.lad_regressor)[:, 0, 0] # [B]
-        sad = jax.nn.gelu(jnp.einsum('btd,df->btf', last_xs, weights.sad_hidden))
-        internals['sad_pred'] = jnp.einsum('btf,fv', sad, weights.sad_predictor)[:, 0, :] # [B, 3]
-        internals['sad_reg'] = jnp.einsum('btf,fv', sad, weights.sad_regressor)[:, 0, 0] # [B]
-
+        lad = jax.nn.gelu(jnp.einsum("btd,df->btf", last_xs, weights.lad_hidden))
+        internals["lad_pred"] = jnp.einsum("btf,fv", lad, weights.lad_predictor)[:, 0, :]  # [B, 3]
+        internals["lad_reg"] = jnp.einsum("btf,fv", lad, weights.lad_regressor)[:, 0, 0]  # [B]
+        sad = jax.nn.gelu(jnp.einsum("btd,df->btf", last_xs, weights.sad_hidden))
+        internals["sad_pred"] = jnp.einsum("btf,fv", sad, weights.sad_predictor)[:, 0, :]  # [B, 3]
+        internals["sad_reg"] = jnp.einsum("btf,fv", sad, weights.sad_regressor)[:, 0, 0]  # [B]
 
     if cache is not None:
         # Sum where there is a valid segment id (i.e. non padding tokens) [B, T] -> [B,]
@@ -830,7 +837,7 @@ def adam_update(
     return param - update, m, v
 
 
-def init_adam_state(weights: Weights):
+def init_optimizer_state(weights: Weights):
     def _zeros_like(old):
         if isinstance(old, jax.ShapeDtypeStruct):
             return jax.ShapeDtypeStruct(old.shape, old.dtype, sharding=old.sharding)
@@ -864,31 +871,47 @@ def cross_entropy_loss(
 
 
 def compute_loss(
-    weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, cfg: Config,
+    weights: Weights,
+    x: jax.Array,
+    segment_ids: jax.Array,
+    y: jax.Array,
+    cfg: Config,
     aux: Any | None = None,
 ) -> tuple[jax.Array, Any]:
     logits, internals = forward(x, segment_ids, weights, cfg, aux=aux)
     # Important assumption that segment_ids 0 is 'padding'.
     loss_mask = jnp.where(segment_ids == 0, 0, 1)
     if not cfg.causal:
-        assert 'bert_mask' in aux
+        assert "bert_mask" in aux
         # Only count the loss for tokens that were masked in BERT.
-        loss_mask &= aux['bert_mask']
+        loss_mask &= aux["bert_mask"]
 
-        
     loss, accuracy, internals = cross_entropy_loss(logits, y, loss_mask, internals)
-    internals['token_prediction_loss'] = loss
+    internals["token_prediction_loss"] = loss
     # TODO(sholto):
     # CE for lad/sad_pred. MSE for lad/sad_regress.
     if aux is not None:
-        aux_mask = jnp.ones_like(aux['lad_category']) # [B]
-        lad_ce, lad_acc = cross_entropy_loss(internals['lad_pred'], aux['lad_category'], aux_mask,)
-        sad_ce, sad_acc = cross_entropy_loss(internals['sad_pred'], aux['sad_category'], aux_mask,)
-        lad_mse = (internals['lad_reg'] - aux['lad_value']) ** 2
-        sad_mse = (internals['sad_reg'] - aux['sad_value']) ** 2
-        (internals['lad_ce'], internals['lad_acc'], internals['sad_ce'],
-          internals['sad_acc'], internals['lad_mse'], internals['sad_mse']) = (lad_ce, lad_acc, sad_ce,
-                                                                                sad_acc, lad_mse, sad_mse)
+        aux_mask = jnp.ones_like(aux["lad_category"])  # [B]
+        lad_ce, lad_acc = cross_entropy_loss(
+            internals["lad_pred"],
+            aux["lad_category"],
+            aux_mask,
+        )
+        sad_ce, sad_acc = cross_entropy_loss(
+            internals["sad_pred"],
+            aux["sad_category"],
+            aux_mask,
+        )
+        lad_mse = (internals["lad_reg"] - aux["lad_value"]) ** 2
+        sad_mse = (internals["sad_reg"] - aux["sad_value"]) ** 2
+        (
+            internals["lad_ce"],
+            internals["lad_acc"],
+            internals["sad_ce"],
+            internals["sad_acc"],
+            internals["lad_mse"],
+            internals["sad_mse"],
+        ) = (lad_ce, lad_acc, sad_ce, sad_acc, lad_mse, sad_mse)
 
     internals["accuracy"] = accuracy
     return loss, internals
@@ -915,7 +938,13 @@ def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: i
 
 
 def update_step(
-    weights: Weights, x: jax.Array, segment_ids: jax.Array, y: jax.Array, opt_state: Any, step: int, cfg: Config,
+    weights: Weights,
+    x: jax.Array,
+    segment_ids: jax.Array,
+    y: jax.Array,
+    opt_state: Any,
+    step: int,
+    cfg: Config,
     aux: Any | None,
 ):
     (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg, aux)
@@ -939,7 +968,7 @@ def input_shardings(
 
 
 # Checkpointing logic
-def make_mgnr(path="/tmp/checkpoint_manager_sharded", erase: bool = False):
+def make_mngr(path="/tmp/checkpoint_manager_sharded", erase: bool = False):
     if erase:
         path = ocp.test_utils.erase_and_create_empty(path)
     options = ocp.CheckpointManagerOptions(max_to_keep=3)
@@ -963,7 +992,7 @@ def load(mngr: ocp.CheckpointManager, cfg: Config, step: int | None = None):
         abstract_weights,
         is_leaf=lambda x: isinstance(x, TensorInfo),
     )
-    opt_shapes_shardings = init_adam_state(weights_shapes_shardings)
+    opt_shapes_shardings = init_optimizer_state(weights_shapes_shardings)
     restored = mngr.restore(
         mngr.latest_step() if step is None else step,
         args=ocp.args.StandardRestore({"weights": weights_shapes_shardings, "opt_state": opt_shapes_shardings}),

@@ -1,6 +1,7 @@
 import os
 import re
 from typing import Any
+
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
@@ -14,77 +15,82 @@ tokenize = lambda x: [stoi.get(ch, 0) for ch in x]
 detokenize = lambda x: "".join([itos.get(i, "U") for i in x])
 
 LAD_CAT = {
-    'inter-LAD': 0,
-    'LAD': 1,
-    'LAD boundary': 2,
+    "inter-LAD": 0,
+    "LAD": 1,
+    "LAD boundary": 2,
 }
 
 SAD_CAT = {
-    'inter-SAD': 0,
-    'SAD': 1,
-    'SAD boundary': 2,
+    "inter-SAD": 0,
+    "SAD": 1,
+    "SAD boundary": 2,
 }
 
-CHROM = {'chr1': 0,
- 'chr2': 1,
- 'chr3': 2,
- 'chr4': 3,
- 'chr5': 4,
- 'chr6': 5,
- 'chr7': 6,
- 'chr8': 7,
- 'chr9': 8,
- 'chr10': 9,
- 'chr11': 10,
- 'chr12': 11,
- 'chr13': 12,
- 'chr14': 13,
- 'chr15': 14,
- 'chr16': 15,
- 'chr17': 16,
- 'chr18': 17,
- 'chr19': 18,
- 'chr20': 19,
- 'chr21': 20,
- 'chr22': 21,
- 'chrX': 22,
- 'chrY': 23}
+CHROM = {
+    "chr1": 0,
+    "chr2": 1,
+    "chr3": 2,
+    "chr4": 3,
+    "chr5": 4,
+    "chr6": 5,
+    "chr7": 6,
+    "chr8": 7,
+    "chr9": 8,
+    "chr10": 9,
+    "chr11": 10,
+    "chr12": 11,
+    "chr13": 12,
+    "chr14": 13,
+    "chr15": 14,
+    "chr16": 15,
+    "chr17": 16,
+    "chr18": 17,
+    "chr19": 18,
+    "chr20": 19,
+    "chr21": 20,
+    "chr22": 21,
+    "chrX": 22,
+    "chrY": 23,
+}
+
 
 def next_multiple(x, n):
     return x + (-x % n)
 
+
 def process_rows(df, output_dir):
-    
+
     df = df.sample(frac=1).reset_index(drop=True)
     record_count = 0
     save_together = 128
     save_together_rows = []
 
-    
     for i in tqdm(range(0, len(df))):
         row = df.iloc[i]
-        if row['Sequence'][0:5] != "NNNNN":
+        if row["Sequence"][0:5] != "NNNNN":
             save_together_rows.append(row)
 
         if len(save_together_rows) == save_together:
             output_file = os.path.join(output_dir, f"record_{record_count}.tfrecord")
-        
+
             with tf.io.TFRecordWriter(output_file) as writer:
                 for row in save_together_rows:
-                    
-                    tokens = tokenize(row['Sequence'])
+
+                    tokens = tokenize(row["Sequence"])
                     bucket = next_multiple(len(tokens), 256)
                     padding = bucket - len(tokens)
                     segment_ids = np.ones_like(tokens)
                     tokens = np.pad(tokens, (0, padding))
                     segment_ids = np.pad(segment_ids, (0, padding))
-                    lad_category = LAD_CAT[row['LMNB1 Cat']]
-                    lad_value = row['LMNB1 Signal']
-                    sad_category = SAD_CAT[row['SON Cat']]
-                    sad_value = row['SON Signal']
-                    chromosome = row['Chrom']  # Keep chromosome as string
-                    save_tfrecord(writer, tokens, segment_ids, lad_category, lad_value, sad_category, sad_value, chromosome)
-            
+                    lad_category = LAD_CAT[row["LMNB1 Cat"]]
+                    lad_value = row["LMNB1 Signal"]
+                    sad_category = SAD_CAT[row["SON Cat"]]
+                    sad_value = row["SON Signal"]
+                    chromosome = row["Chrom"]  # Keep chromosome as string
+                    save_tfrecord(
+                        writer, tokens, segment_ids, lad_category, lad_value, sad_category, sad_value, chromosome
+                    )
+
             record_count += 1
             save_together_rows = []
         else:
@@ -101,7 +107,9 @@ def save_tfrecord(writer, tokens, segment_ids, lad_category, lad_value, sad_cate
                 "lad_value": tf.train.Feature(float_list=tf.train.FloatList(value=[lad_value])),
                 "sad_category": tf.train.Feature(int64_list=tf.train.Int64List(value=[sad_category])),
                 "sad_value": tf.train.Feature(float_list=tf.train.FloatList(value=[sad_value])),
-                "chromosome": tf.train.Feature(bytes_list=tf.train.BytesList(value=[chromosome.encode()])),  # Save as bytes
+                "chromosome": tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[chromosome.encode()])
+                ),  # Save as bytes
             }
         )
     )
@@ -119,6 +127,7 @@ def feature_description() -> Any:
         "chromosome": tf.io.FixedLenFeature([], tf.string),  # Change to string
     }
 
+
 def load_and_retokenize_tfrecord(file_path: str):
     retokenized_data = []
     feature_data = {
@@ -130,26 +139,26 @@ def load_and_retokenize_tfrecord(file_path: str):
         "chromosome": [],
     }
 
-    
     def _parse_function(example_proto):
         return tf.io.parse_single_example(example_proto, feature_description())
-    
+
     dataset = tf.data.TFRecordDataset(file_path)
     parsed_dataset = dataset.map(_parse_function)
-    
+
     for parsed_record in parsed_dataset:
         x = parsed_record["x"].numpy()
-        
+
         original_sequence = detokenize(x)  # Assuming detokenize function is defined elsewhere
         retokenized_data.append(original_sequence)
-        
+
         for feature in feature_data.keys():
             if feature == "chromosome":
                 feature_data[feature].append(parsed_record[feature].numpy().decode())  # Decode bytes to string
             else:
                 feature_data[feature].append(parsed_record[feature].numpy())
-    
+
     return retokenized_data, feature_data
+
 
 def create_iterator(file_pattern: str, batch_size: int, shuffle: bool = False):
     """Creates a python iterator to load batches."""

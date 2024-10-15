@@ -1,6 +1,7 @@
 import os
 import re
 from typing import Any
+
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
@@ -25,6 +26,7 @@ def preprocess_dna_sequence(x, sequence_length):
 
 def next_multiple(x, n):
     return x + (-x % n)
+
 
 def process_and_save_tfrecords(dataset, output_dir, sequence_length):
     os.makedirs(output_dir, exist_ok=True)
@@ -74,7 +76,7 @@ def process_and_save_tfrecords(dataset, output_dir, sequence_length):
                 current_segment_ids = []
         # Save to write every 100 sequences.
         if len(tokens_to_save) > 500:
-            save_records(output_dir, record_count, tokens_to_save, segment_ids_to_save, sequence_length)    
+            save_records(output_dir, record_count, tokens_to_save, segment_ids_to_save, sequence_length)
             tokens_to_save = []
             segment_ids_to_save = []
             record_count += 1
@@ -98,7 +100,6 @@ def save_tfrecord(writer, tokens, segment_ids):
 
 def save_records(output_dir, record_count, tokens_list, segment_ids_list, sequence_length):
     # Pad if necessary
-
 
     output_file = os.path.join(output_dir, f"record_{record_count}.tfrecord")
     with tf.io.TFRecordWriter(output_file) as writer:
@@ -144,6 +145,7 @@ def load_and_retokenize_tfrecord(file_path: str) -> list[str]:
         segment_ids.append(seg_ids)
 
     return retokenized_data, segment_ids
+
 
 def create_iterator(file_pattern: str, batch_size: int, shuffle: bool = False):
     """Creates a python iterator to load batches."""

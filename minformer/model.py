@@ -2,18 +2,18 @@
 
 import dataclasses
 import math
+from collections import namedtuple
 from dataclasses import field
 from functools import partial
 from typing import Any, Callable
 
-from collections import namedtuple
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 from flax import struct
+from jax.experimental import mesh_utils
 from jax.experimental.pallas.ops.tpu import flash_attention
 from jax.experimental.shard_map import shard_map
-from jax.experimental import mesh_utils
 from jax.sharding import PartitionSpec as P
 
 
@@ -74,6 +74,7 @@ def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRul
     """Converts logical to sharding."""
     return jax.sharding.NamedSharding(mesh, _logical_to_physical(logical, rules))
 
+
 @struct.dataclass
 class Config:
     d_model: int
@@ -96,6 +97,11 @@ class Config:
     # Optimizer config
     max_lr: float = 3e-4
     min_lr: float = 1e-5
+    weight_decay: float = 1e-2
+    beta1: float = 0.9
+    beta2: float = 0.999
+    eps: float = 1e-8
+    amsgrad: bool = False
     warmup_steps: int = 50
     total_steps: int = 10000
     # Rescale gradients which spike.
@@ -118,9 +124,10 @@ class Layer:
     proj: jax.Array | TensorInfo
     w1: jax.Array | TensorInfo
     w2: jax.Array | TensorInfo
-    gamma1: jax.Array | TensorInfo
-    gamma2: jax.Array | TensorInfo
-    gamma_final: jax.Array | TensorInfo
+    attn_gamma: jax.Array | TensorInfo
+    ffn_gamma: jax.Array | TensorInfo
+    q_gamma: jax.Array | TensorInfo
+    k_gamma: jax.Array | TensorInfo
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -143,7 +150,7 @@ class Layer:
             proj=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.query_heads, cfg.key_dim, cfg.d_model), cfg.weight_dtype_at_rest),
                 ("query_heads", "key_dim", "d_model"),
-                jax.nn.initializers.he_normal(in_axis=(0, 1), out_axis=2),
+                jax.nn.initializers.zeros,
             ),
             w1=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype_at_rest),
@@ -153,21 +160,26 @@ class Layer:
             w2=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model * cfg.ffw_multiplier, cfg.d_model), cfg.weight_dtype_at_rest),
                 ("ffw", "d_model"),
-                jax.nn.initializers.he_normal(in_axis=1, out_axis=0),
+                jax.nn.initializers.zeros,
             ),
-            gamma1=TensorInfo(
+            attn_gamma=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
             ),
-            gamma2=TensorInfo(
+            ffn_gamma=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
             ),
-            gamma_final=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
-                ("d_model",),
+            q_gamma=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.key_dim,), cfg.weight_dtype_at_rest),
+                ("key_dim",),
+                jax.nn.initializers.constant(1.0),
+            ),
+            k_gamma=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.key_dim,), cfg.weight_dtype_at_rest),
+                ("key_dim",),
                 jax.nn.initializers.constant(1.0),
             ),
         )
@@ -177,7 +189,7 @@ class Layer:
 class Weights:
     layers: list[Layer]
     embedding: jax.Array | TensorInfo
-    vocab_proj: jax.Array | TensorInfo
+    gamma_final: jax.Array | TensorInfo
 
     @classmethod
     def abstract(cls, cfg: Config):
@@ -188,10 +200,10 @@ class Weights:
                 ("vocab", "d_model"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
-            vocab_proj=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype_at_rest),
-                ("d_model", "vocab"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
+            gamma_final=TensorInfo(
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
+                ("d_model",),
+                jax.nn.initializers.constant(1.0),
             ),
         )
 
@@ -421,20 +433,27 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     )
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
-        return flash_attention.flash_attention(q, k, v, segment_ids=segment_ids, causal=True, sm_scale=scale,
-                                                block_sizes=flash_attention.BlockSizes(
-                                                block_q=512,
-                                                block_k_major=512,
-                                                block_k=512,
-                                                block_b=1,
-                                                block_q_major_dkv=512,
-                                                block_k_major_dkv=512,
-                                                block_k_dkv=512,
-                                                block_q_dkv=512,
-                                                block_k_major_dq=512,
-                                                block_k_dq=512,
-                                                block_q_dq=512
-                                               ))
+        return flash_attention.flash_attention(
+            q,
+            k,
+            v,
+            segment_ids=segment_ids,
+            causal=True,
+            sm_scale=scale,
+            block_sizes=flash_attention.BlockSizes(
+                block_q=512,
+                block_k_major=512,
+                block_k=512,
+                block_b=1,
+                block_q_major_dkv=512,
+                block_k_major_dkv=512,
+                block_k_dkv=512,
+                block_q_dkv=512,
+                block_k_major_dq=512,
+                block_k_dq=512,
+                block_q_dq=512,
+            ),
+        )
 
     return _f(q, k, v, q_segment_ids, kv_segment_ids).astype(jnp.bfloat16)
 
@@ -445,33 +464,31 @@ def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
     return gamma * x / rms
 
 
-def forward_layer(
+def attention_block(
     x: jax.Array,
     segment_ids: jax.Array,
     layer: Layer,
     sin: jax.Array,
     cos: jax.Array,
-    idx: int,
     cfg: Config,
     cache: KVCache | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    # First RMSNorm (Pre-LN for attention)
-
-    # Cast layer to bfloat16 for faster operations.
-    layer = jax.tree.map(lambda x: cfg.active_weight_dtype(x), layer)
-    with jax.named_scope("attn_pre_norm"):
-        attn_in = rms_norm(x, layer.gamma1)
-
+    idx: int | None = None,
+):
     # Multi-head attention
     with jax.named_scope("qkv_matmul"):
-        q = jnp.einsum("btd,dhq->bhtq", attn_in, layer.q)
-        k = jnp.einsum("btd,dhk->bhtk", attn_in, layer.k)
-        v = jnp.einsum("btd,dhv->bhtv", attn_in, layer.v)
+        q = jnp.einsum("btd,dhq->bhtq", x, layer.q)
+        k = jnp.einsum("btd,dhk->bhtk", x, layer.k)
+        v = jnp.einsum("btd,dhv->bhtv", x, layer.v)
 
     # Apply rotary embeddings
     with jax.named_scope("rope"):
         q = apply_rotary_embedding(q, sin, cos)
         k = apply_rotary_embedding(k, sin, cos)
+
+    # QKNorm
+    with jax.named_scope("qk_norm"):
+        q = rms_norm(q, layer.q_gamma)
+        k = rms_norm(k, layer.k_gamma)
 
     with jax.named_scope("cache_update"):
         if cache is not None:
@@ -490,12 +507,8 @@ def forward_layer(
             incremental_positions = jnp.sum(segment_ids != 0, axis=-1)  # [B,]
             # I.e. valid below where we've written things [B, T]
             k_segment_ids = jnp.where(time_indices < (cache.lengths + incremental_positions)[:, None], 1, 0)
-            # Mask our new k and v so that its very visible and easy to test kv values being entered.
-            # Tiny perf hit b/c it is unnecessary.
-            k, v = (
-                k * k_segment_ids[:, None, :, None],
-                v * k_segment_ids[:, None, :, None],
-            )
+            # Mask our new k and v so that its very visible and easy to test kv values being entered. Tiny perf hit b/c it is unnecessary.
+            k, v = k * k_segment_ids[:, None, :, None], v * k_segment_ids[:, None, :, None]
             q_offset = cache.lengths
         else:
             q_segment_ids = segment_ids
@@ -515,21 +528,42 @@ def forward_layer(
     with jax.named_scope("projection"):
         attn_out = jnp.einsum("bhtq,hqd->btd", attn_out, layer.proj)
 
-    # Residual connection
+    return attn_out, k, v
+
+
+def ffn_block(x: jax.Array, layer: Layer):
+    with jax.named_scope("ffn"):
+        ff_out = jnp.einsum("btd,df->btf", x, layer.w1)
+        ff_out = jax.nn.relu(ff_out) ** 2  # https://arxiv.org/abs/2109.08668v2
+        ff_out = jnp.einsum("btf,fd->btd", ff_out, layer.w2)
+
+    return ff_out
+
+
+def forward_layer(
+    x: jax.Array,
+    segment_ids: jax.Array,
+    layer: Layer,
+    sin: jax.Array,
+    cos: jax.Array,
+    idx: int,
+    cfg: Config,
+    cache: KVCache | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    # Cast layer to bfloat16 for faster operations.
+    layer = jax.tree.map(lambda x: cfg.active_weight_dtype(x), layer)
+
+    # Attention block
+    with jax.named_scope("attn_pre_norm"):
+        attn_in = rms_norm(x, layer.attn_gamma)
+    attn_out, k, v = attention_block(attn_in, segment_ids, layer, sin, cos, cfg, cache, idx)
     with jax.named_scope("residual"):
         x = x + attn_out
 
-    # Second RMSNorm (Pre-LN for FFN)
+    # FFN block
     with jax.named_scope("ffn_pre_norm"):
-        ff_in = rms_norm(x, layer.gamma2)
-
-    # FFN
-    with jax.named_scope("ffw"):
-        ff_out = jnp.einsum("btd,df->btf", ff_in, layer.w1)
-        ff_out = jax.nn.gelu(ff_out)
-        ff_out = jnp.einsum("btf,fd->btd", ff_out, layer.w2)
-
-    # Residual connection
+        ff_in = rms_norm(x, layer.ffn_gamma)
+    ff_out = ffn_block(ff_in, layer)
     with jax.named_scope("residual"):
         x = x + ff_out
 
@@ -569,7 +603,7 @@ def forward(
     # Final layer norm.
     x = rms_norm(x, weights.gamma_final)
     # Project to vocabulary size
-    logits = jnp.einsum("btd,dv->btv", x, weights.vocab_proj)
+    logits = jnp.einsum("btd,vd->btv", x, weights.embedding)
     if cache is not None:
         # Sum where there is a valid segment id (i.e. non padding tokens) [B, T] -> [B,]
         cache = dataclasses.replace(cache, lengths=cache.lengths + jnp.sum(segment_ids != 0, axis=-1))
@@ -593,16 +627,19 @@ def get_lr_with_cosine_decay_and_warmup(step: int, total_steps: int, max_lr: flo
     return jax.lax.cond(step < warmup_steps, warmup, cosine_decay, step)
 
 
-def adam_update(
+def adamw_update(
     param: jax.Array,
     grad: jax.Array,
     m: jax.Array,
     v: jax.Array,
+    v_max: jax.Array,
     lr: float,
     t: int,
-    beta1=0.9,
-    beta2=0.999,
-    eps=1e-8,
+    weight_decay: float = 0.01,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+    amsgrad: bool = False,
 ):
     # Momentum.
     m = beta1 * m + (1 - beta1) * grad
@@ -611,20 +648,30 @@ def adam_update(
     # Debiasing (helps with early training).
     m_hat = m / (1 - beta1 ** (t + 1))
     v_hat = v / (1 - beta2 ** (t + 1))
+
     # Adjusts the gradient update w/ momentum by the variance. Effectively
     # high variance = more cautious step, low variance = more aggressive step.
-    update = lr * m_hat / (jnp.sqrt(v_hat) + eps)
-    return param - update, m, v
+    if amsgrad:
+        # AMSGrad: Keep the maximum of past and current v_hat
+        v_max = jnp.maximum(v_max, v_hat)
+        # Use v_max for the update
+        update = lr * m_hat / (jnp.sqrt(v_max) + eps)
+    else:
+        update = lr * m_hat / (jnp.sqrt(v_hat) + eps)
+
+    # AdamW: Apply weight decay after the main gradient-based update
+    param_update = param - update - lr * weight_decay * param
+    return param_update, m, v, v_max
 
 
-def init_adam_state(weights: Weights):
+def init_optimizer_state(weights: Weights):
     def _zeros_like(old):
         if isinstance(old, jax.ShapeDtypeStruct):
             return jax.ShapeDtypeStruct(old.shape, old.dtype, sharding=old.sharding)
         else:
             return jax.device_put(jnp.zeros_like(old), old.sharding)
 
-    return jax.tree_map(lambda p: (_zeros_like(p), _zeros_like(p)), weights)
+    return jax.tree_map(lambda p: (_zeros_like(p), _zeros_like(p), _zeros_like(p)), weights)
 
 
 def cross_entropy_loss(
@@ -666,14 +713,16 @@ def compute_loss(
 
 def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: int, cfg: Config, internals: Any):
     def update_fn(param, grad, state, grad_norm):
-        m, v = state
+        m, v, v_max = state
         # Clip and rescale gradients when they exceed a specified value, useful for training instabilities.
         # This clips per parameter - rather than globally, but that lets us overlap weights sync on the bwd pass.
         # Bit hacky? TBD if needed.
         scale_factor = jnp.maximum(grad_norm, cfg.grad_norm_clip)
         grad = grad / scale_factor.astype(grad.dtype) * cfg.grad_norm_clip
-        param_update, m_new, v_new = adam_update(param, grad, m, v, lr, t)
-        return param_update, (m_new, v_new)
+        param_update, m_new, v_new, v_max_new = adamw_update(
+            param, grad, m, v, v_max, lr, t, cfg.weight_decay, cfg.beta1, cfg.beta2, cfg.eps, cfg.amsgrad
+        )
+        return param_update, (m_new, v_new, v_max_new)
 
     grad_norms = jax.tree.map(jnp.linalg.norm, grads)
     internals["grad_norms"] = grad_norms
@@ -712,7 +761,7 @@ def input_shardings(
 
 
 # Checkpointing logic
-def make_mgnr(path="/tmp/checkpoint_manager_sharded", erase: bool = False):
+def make_mngr(path="/tmp/checkpoint_manager_sharded", erase: bool = False):
     if erase:
         path = ocp.test_utils.erase_and_create_empty(path)
     options = ocp.CheckpointManagerOptions(max_to_keep=3)
@@ -736,7 +785,7 @@ def load(mngr: ocp.CheckpointManager, cfg: Config, step: int | None = None):
         abstract_weights,
         is_leaf=lambda x: isinstance(x, TensorInfo),
     )
-    opt_shapes_shardings = init_adam_state(weights_shapes_shardings)
+    opt_shapes_shardings = init_optimizer_state(weights_shapes_shardings)
     restored = mngr.restore(
         mngr.latest_step() if step is None else step,
         args=ocp.args.StandardRestore({"weights": weights_shapes_shardings, "opt_state": opt_shapes_shardings}),
