@@ -4,7 +4,11 @@
 python3 projects/bio/download_data.py
 
 python3 projects/bio/download_data.py --dataset open-genome-imgpr --use-gcs --bucket-name minformer_data --sequence-length=16384
-python3 projects/bio/download_data.py --dataset shae_8k --use-gcs --bucket-name minformer_data --sequence-length=8192
+python3 projects/bio/download_data.py --dataset drosophila_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
+python3 projects/bio/download_data.py --dataset macaque_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
+python3 projects/bio/download_data.py --dataset mouse_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
+python3 projects/bio/download_data.py --dataset zebrafish_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
+python3 projects/bio/download_data.py --dataset 8kb_genomic_bins_with_sequences_GW17IPC --use-gcs --bucket-name minformer_data --sequence-length=8192
 """
 
 import argparse
@@ -19,13 +23,14 @@ import pandas as pd
 from datasets import load_dataset
 from google.cloud import storage
 
+EUKARYOTE = ['drosophila_genome_8192bp_bins_no_N', 'macaque_genome_8192bp_bins_no_N', 'mouse_genome_8192bp_bins_no_N', 'zebrafish_genome_8192bp_bins_no_N', '8kb_genomic_bins_with_sequences_GW17IPC']
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download and process DNA data")
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["human-genome-8192", "open-genome-imgpr", "shae_8k"],
+        choices=["human-genome-8192", "open-genome-imgpr"] + EUKARYOTE,
         default="open-genome-imgpr",
         help="Type of dataset to download and process",
     )
@@ -63,6 +68,8 @@ def load_csv_from_gcp_bucket(bucket_name, file_name):
 
     # Read the CSV file into a pandas DataFrame
     df = pd.read_csv(data_file)
+
+    print(df.columns)
 
     return df
 
@@ -113,13 +120,13 @@ def main():
             sequence_length=args.sequence_length,
         )
         # data_hf.process_and_save_tfrecords(hf_ds['test'], os.path.join(output_dir, "stage1/test"), sequence_length=16384)
-    elif args.dataset == "shae_8k":
+    elif args.dataset in EUKARYOTE:
         bucket_name = "minformer_data"
-        file_name = "genomic_bins/8kb_genomic_bins_with_sequences_GW17IPC.csv"
+        file_name = f"eukaryote_pands/{args.dataset}.csv"
         print("Loading csv - takes two minutes.")
         df = load_csv_from_gcp_bucket(bucket_name, file_name)
         output_dir = f"gs://{args.bucket_name}/{args.dataset}/tfrecords/"
-        data_shae.process_rows(df, output_dir=output_dir)
+        data_shae.process_rows(df, output_dir=output_dir, bucket=args.sequence_length)
 
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")

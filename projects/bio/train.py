@@ -4,7 +4,7 @@
 For open genome:
 
 python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v3/ --log_every=10
-python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=1000 --max_seq_len=8192 --data_dir=gs://minformer_data/shae_8k/tfrecords/ --dataset=shae_8k --log_every=10
+python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=1000 --max_seq_len=8192 --dataset=shae_8k --log_every=10
 
 """
 
@@ -28,19 +28,19 @@ from tensorboardX import SummaryWriter
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DNA Sequence Training Script")
-    parser.add_argument("--d_model", type=int, default=1024, help="Model dimension")
+    parser.add_argument("--d_model", type=int, default=2048, help="Model dimension")
     parser.add_argument("--ffw_multiplier", type=int, default=4, help="FFW multiplier")
     parser.add_argument("--query_heads", type=int, default=8, help="Number of query heads")
     parser.add_argument("--key_heads", type=int, default=8, help="Number of key heads")
-    parser.add_argument("--num_layers", type=int, default=8, help="Number of layers")
+    parser.add_argument("--num_layers", type=int, default=12, help="Number of layers")
     parser.add_argument("--key_dim", type=int, default=128, help="Key dimension")
     parser.add_argument("--vocab_size", type=int, default=8, help="Vocabulary size")
     parser.add_argument("--max_seq_len", type=int, default=16384, help="Maximum sequence length")
     parser.add_argument("--max_lr", type=float, default=3e-4, help="Maximum learning rate")
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--warmup_steps", type=int, default=50, help="Number of warmup steps")
-    parser.add_argument("--total_steps", type=int, default=15000, help="Total number of training steps")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--total_steps", type=int, default=30000, help="Total number of training steps")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
@@ -98,8 +98,16 @@ def main():
         )
         process_batch = model.process_batch
     elif args.dataset == "shae_8k":
+        eukaroytes = ['drosophila_genome_8192bp_bins_no_N',
+                    'macaque_genome_8192bp_bins_no_N',
+                    'mouse_genome_8192bp_bins_no_N',
+                    'zebrafish_genome_8192bp_bins_no_N',
+                    '8kb_genomic_bins_with_sequences_GW17IPC']
+        stage_1 = [f"gs://minformer_data/{e}/tfrecords/record_*.tfrecord" for e in eukaroytes]
+        # Do second stage on human only.
+        stage_2 = [ "gs://minformer_data/shae_8k/tfrecords/record_*.tfrecord"]
         iter = data_shae.create_iterator(
-            str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True
+           stage_1=stage_1, stage_2=stage_2, batch_size=args.batch_size, shuffle=True
         )
         process_batch = model.process_batch_shae
 

@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
+import random
 
 PADDING = "P"
 VOCAB = [PADDING, "U", "A", "C", "G", "T", "N"]  #  padding, unknown, A, C, G, T
@@ -58,7 +59,7 @@ def next_multiple(x, n):
     return x + (-x % n)
 
 
-def process_rows(df, output_dir):
+def process_rows(df, output_dir, bucket: int):
 
     df = df.sample(frac=1).reset_index(drop=True)
     record_count = 0
@@ -77,16 +78,22 @@ def process_rows(df, output_dir):
                 for row in save_together_rows:
 
                     tokens = tokenize(row["Sequence"])
-                    bucket = next_multiple(len(tokens), 256)
                     padding = bucket - len(tokens)
                     segment_ids = np.ones_like(tokens)
                     tokens = np.pad(tokens, (0, padding))
                     segment_ids = np.pad(segment_ids, (0, padding))
-                    lad_category = LAD_CAT[row["LMNB1 Cat"]]
-                    lad_value = row["LMNB1 Signal"]
-                    sad_category = SAD_CAT[row["SON Cat"]]
-                    sad_value = row["SON Signal"]
-                    chromosome = row["Chrom"]  # Keep chromosome as string
+                    if "LMNB1 Cat" in row:
+                        lad_category = LAD_CAT[row["LMNB1 Cat"]]
+                        lad_value = row["LMNB1 Signal"]
+                        sad_category = SAD_CAT[row["SON Cat"]]
+                        sad_value = row["SON Signal"]
+                        chromosome = row["Chrom"]  # Keep chromosome as string
+                    else:
+                        lad_category = 0
+                        lad_value = 0
+                        sad_category = 0
+                        sad_value = 0
+                        chromosome = "NA"
                     save_tfrecord(
                         writer, tokens, segment_ids, lad_category, lad_value, sad_category, sad_value, chromosome
                     )
@@ -160,18 +167,40 @@ def load_and_retokenize_tfrecord(file_path: str):
     return retokenized_data, feature_data
 
 
-def create_iterator(file_pattern: str, batch_size: int, shuffle: bool = False):
+def create_iterator(stage_1: list[str], stage_2: list[str], batch_size: int, shuffle: bool = False):
     """Creates a python iterator to load batches."""
 
     def _parse_function(example_proto):
         parsed_features = tf.io.parse_single_example(example_proto, feature_description())
         return parsed_features
 
-    files = tf.data.Dataset.list_files(file_pattern)
+    # List all files matching the patterns
+    stage_1_files = []
+    for pattern in stage_1:
+        stage_1_files.extend(tf.io.gfile.glob(pattern))
+
+    # Shuffle the file list
+    random.shuffle(stage_1_files)
+
+    print(f"Found {len(stage_1_files)} files for stage 1")
+
+    # Now (for example human genome), we want to have the end of
+    # training focused on this.
+    stage_2_files = []
+    for pattern in stage_2:
+        stage_2_files.extend(tf.io.gfile.glob(pattern))
+
+    print(f"Found {len(stage_2_files)} files for stage 2")
+
+    # Shuffle the file list
+    random.shuffle(stage_2_files)
+
+    # Combine them.
+    files = stage_1_files + stage_2_files
     dataset = tf.data.TFRecordDataset(files)
     dataset = dataset.map(_parse_function, num_parallel_calls=32)
     if shuffle:
-        dataset = dataset.shuffle(buffer_size=100)
+        dataset = dataset.shuffle(buffer_size=1000)
     dataset = dataset.batch(batch_size)
     dataset = dataset.prefetch(32)
 
