@@ -214,11 +214,11 @@ def test_incremental_prefill():
     chunk_c, segment_ids_c = model.prepare_chunk(chunk_c, pad_to=16, pad_id=0)
 
     # Run incremental prefill
-    logits_c, prefill_cache_c, _ = model.forward(chunk_c, segment_ids_c, weights, inference_config, prefill_cache)
+    logits_c, prefill_cache_c, _, _ = model.forward(chunk_c, segment_ids_c, weights, inference_config, prefill_cache)
 
     prefill_cache = model.KVCache.init(cfg=inference_config, batch_size=1, max_seq_len=2048)
-    logits_a, prefill_cache, _ = model.forward(chunk_a, segment_ids_a, weights, inference_config, prefill_cache)
-    logits_b, prefill_cache, _ = model.forward(chunk_b, segment_ids_b, weights, inference_config, prefill_cache)
+    logits_a, prefill_cache, _, _ = model.forward(chunk_a, segment_ids_a, weights, inference_config, prefill_cache)
+    logits_b, prefill_cache, _, _ = model.forward(chunk_b, segment_ids_b, weights, inference_config, prefill_cache)
 
     # Assert cache lengths
     assert jnp.array_equal(prefill_cache_c.lengths, jnp.array([9])), "Cache length mismatch for chunk_c"

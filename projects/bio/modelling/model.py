@@ -788,7 +788,7 @@ def forward(
     # If we have aux to predict (i.e. laminar associated domains, do so):
     if aux is not None:
         last_nonzero = jnp.sum(segment_ids > 0, axis=-1)
-        indices = last_nonzero[:, None, None]
+        indices = last_nonzero[:, None, None] - 1
         last_xs = jnp.take_along_axis(x, indices, 1)
         assert last_xs.shape[1] == 1
         lad = jax.nn.gelu(jnp.einsum("btd,df->btf", last_xs, weights.lad_hidden))
@@ -801,8 +801,8 @@ def forward(
     if cache is not None:
         # Sum where there is a valid segment id (i.e. non padding tokens) [B, T] -> [B,]
         cache = dataclasses.replace(cache, lengths=cache.lengths + jnp.sum(segment_ids != 0, axis=-1))
-        return logits, cache, internals
-    return logits, internals
+        return logits, cache, internals, x
+    return logits, internals, x
 
 
 # Training.
@@ -878,7 +878,7 @@ def compute_loss(
     cfg: Config,
     aux: Any | None = None,
 ) -> tuple[jax.Array, Any]:
-    logits, internals = forward(x, segment_ids, weights, cfg, aux=aux)
+    logits, internals, _ = forward(x, segment_ids, weights, cfg, aux=aux)
     # Important assumption that segment_ids 0 is 'padding'.
     loss_mask = jnp.where(segment_ids == 0, 0, 1)
     if not cfg.causal:
@@ -888,31 +888,6 @@ def compute_loss(
 
     loss, accuracy, internals = cross_entropy_loss(logits, y, loss_mask, internals)
     internals["token_prediction_loss"] = loss
-    # TODO(sholto):
-    # CE for lad/sad_pred. MSE for lad/sad_regress.
-    if aux is not None:
-        aux_mask = jnp.ones_like(aux["lad_category"])  # [B]
-        lad_ce, lad_acc = cross_entropy_loss(
-            internals["lad_pred"],
-            aux["lad_category"],
-            aux_mask,
-        )
-        sad_ce, sad_acc = cross_entropy_loss(
-            internals["sad_pred"],
-            aux["sad_category"],
-            aux_mask,
-        )
-        lad_mse = (internals["lad_reg"] - aux["lad_value"]) ** 2
-        sad_mse = (internals["sad_reg"] - aux["sad_value"]) ** 2
-        (
-            internals["lad_ce"],
-            internals["lad_acc"],
-            internals["sad_ce"],
-            internals["sad_acc"],
-            internals["lad_mse"],
-            internals["sad_mse"],
-        ) = (lad_ce, lad_acc, sad_ce, sad_acc, lad_mse, sad_mse)
-
     internals["accuracy"] = accuracy
     return loss, internals
 
@@ -946,8 +921,14 @@ def update_step(
     step: int,
     cfg: Config,
     aux: Any | None,
+    override_compute_loss_fn = None
 ):
-    (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(weights, x, segment_ids, y, cfg, aux)
+    if override_compute_loss_fn:
+        compute_loss_fn = override_compute_loss_fn
+    else:
+        compute_loss_fn = compute_loss
+
+    (loss, internals), grads = jax.value_and_grad(compute_loss_fn, has_aux=True)(weights, x, segment_ids, y, cfg, aux)
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
     weights, opt_state, internals = update_weights(weights, grads, opt_state, lr, step, cfg, internals)
     internals["lr"] = lr

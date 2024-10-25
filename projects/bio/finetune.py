@@ -82,6 +82,56 @@ def log_metrics(writer, metrics, step):
             writer.add_scalar(key, value.item(), step)
 
 
+def compute_loss(
+    weights: model.Weights,
+    x: jax.Array,
+    segment_ids: jax.Array,
+    y: jax.Array,
+    cfg: model.Config,
+    aux: Any | None = None,
+) -> tuple[jax.Array, Any]:
+    logits, internals, x = model.forward(x, segment_ids, weights, cfg, aux=aux)
+    # Important assumption that segment_ids 0 is 'padding'.
+    loss_mask = jnp.where(segment_ids == 0, 0, 1)
+    if not cfg.causal:
+        assert "bert_mask" in aux
+        # Only count the loss for tokens that were masked in BERT.
+        loss_mask &= aux["bert_mask"]
+
+    loss, accuracy, internals = model.cross_entropy_loss(logits, y, loss_mask, internals)
+    internals["token_prediction_loss"] = loss
+    # TODO(sholto):
+    # CE for lad/sad_pred. MSE for lad/sad_regress.
+    if aux is not None:
+        aux_mask = jnp.ones_like(aux["lad_category"][:, 0])  # [B]
+        lad_ce, lad_acc = model.cross_entropy_loss(
+            internals["lad_pred"],
+            aux["lad_category"][:, 0],
+            aux_mask,
+        )
+        sad_ce, sad_acc = model.cross_entropy_loss(
+            internals["sad_pred"],
+            aux["sad_category"][:, 0],
+            aux_mask,
+        )
+        lad_mse = ((internals["lad_reg"] - aux["lad_value"][:, 0]) ** 2).sum()
+        sad_mse = ((internals["sad_reg"] - aux["sad_value"][:, 0]) ** 2).sum()
+        (
+            internals["lad_ce"],
+            internals["lad_acc"],
+            internals["sad_ce"],
+            internals["sad_acc"],
+            internals["lad_mse"],
+            internals["sad_mse"],
+        ) = (lad_ce, lad_acc, sad_ce, sad_acc, lad_mse, sad_mse)
+
+    internals["accuracy"] = accuracy
+
+    # Only fine-tune!
+    loss += 1 * (lad_ce + sad_ce) + 0.1 * (lad_mse + sad_mse)
+    return loss, internals
+
+
 def main():
     args = parse_args()
 
@@ -155,8 +205,8 @@ def main():
         start_step = 0
 
     # JIT-compile the update step
-    step = jax.jit(model.update_step, static_argnames="cfg")
-    step = functools.partial(step, cfg=cfg)
+    step = jax.jit(model.update_step, static_argnames=["cfg", "override_compute_loss_fn"])
+    step = functools.partial(step, cfg=cfg, override_compute_loss_fn=compute_loss)
 
     # Training loop
     with SummaryWriter(log_dir) as writer:
@@ -197,7 +247,7 @@ def main():
                     jax.block_until_ready(loss)
             else:
                 loss, weights, opt_state, internals = step(
-                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i, aux=batch["aux"]
+                    weights, batch["x"], batch["segment_ids"], batch["y"], opt_state, i, aux=batch["aux"],
                 )
 
             if i % args.log_every == 0:
