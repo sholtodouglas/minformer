@@ -587,8 +587,8 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
 
 def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
     """Apply RMS normalization."""
-    rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + 1e-6)
-    return gamma * x / rms
+    rms = jnp.sqrt(jnp.mean(jnp.astype(x, jnp.float32)**2, axis=-1, keepdims=True) + 1e-6)
+    return jnp.astype(gamma * x / rms, jnp.bfloat16)
 
 
 def forward_layer(
@@ -603,8 +603,14 @@ def forward_layer(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # First RMSNorm (Pre-LN for attention)
 
-    # Cast layer to bfloat16 for faster operations.
-    layer = jax.tree.map(lambda x: cfg.active_weight_dtype(x), layer)
+    # Cast non-norms to bfloat16 for faster operations.
+    layer = dataclasses.replace(layer,
+                                q=cfg.active_weight_dtype(layer.q),
+                                k=cfg.active_weight_dtype(layer.k),
+                                v=cfg.active_weight_dtype(layer.v),
+                                w1=cfg.active_weight_dtype(layer.w1),
+                                w2=cfg.active_weight_dtype(layer.w2),
+    )
     with jax.named_scope("attn_pre_norm"):
         attn_in = rms_norm(x, layer.attn_in_gamma)
 

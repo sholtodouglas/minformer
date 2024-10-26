@@ -3,8 +3,7 @@
 
 For open genome:
 
-python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v3/ --log_every=10
-python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=1000 --max_seq_len=8192 --dataset=shae_8k --log_every=10
+python3 projects/bio/finetune.py --pretrained_checkpoint_dir=gs://minformer_data/pretrained_ckpt/v1 --finetuned_checkpoint_dir=gs://minformer_data/finetuned_ckpt/v1 --checkpoint_interval=1000 --max_seq_len=8192 --dataset=shae_8k --log_every=10
 
 """
 
@@ -40,18 +39,18 @@ def parse_args():
     parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--warmup_steps", type=int, default=50, help="Number of warmup steps")
     parser.add_argument("--total_steps", type=int, default=30000, help="Total number of training steps")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
     parser.add_argument("--log_dir", type=str, default="/tmp/logs/shae", help="Base directory for TensorBoard logs")
     parser.add_argument(
-        "--checkpoint_dir", type=str, default="/tmp/dna_checkpoints", help="Directory for saving checkpoints"
+        "--pretrained_checkpoint_dir", type=str, default="gs://minformer_data/pretrained_ckpt/v1", help="Directory for loading checkpoints"
+    )
+    parser.add_argument(
+        "--finetuned_checkpoint_dir", type=str, default="gs://minformer_data/finetuned_ckpt/v1", help="Directory for saving checkpoints"
     )
     parser.add_argument("--checkpoint_interval", type=int, default=1000, help="Save checkpoint every N steps")
-    parser.add_argument(
-        "--resume_from_checkpoint", action="store_true", help="Resume training from the latest checkpoint"
-    )
     parser.add_argument(
         "--dataset",
         type=str,
@@ -142,24 +141,13 @@ def main():
 
     # Data setup
     # TODO: Configure.
-    if args.dataset == "open-genome-imgpr":
-        iter = data_hf.create_iterator(
-            str(args.data_dir) + "record_*.tfrecord", batch_size=args.batch_size, shuffle=True
-        )
-        process_batch = model.process_batch
-    elif args.dataset == "shae_8k":
-        eukaroytes = ['drosophila_genome_8192bp_bins_no_N',
-                    'macaque_genome_8192bp_bins_no_N',
-                    'mouse_genome_8192bp_bins_no_N',
-                    'zebrafish_genome_8192bp_bins_no_N',
-                    '8kb_genomic_bins_with_sequences_GW17IPC']
-        stage_1 = [f"gs://minformer_data/{e}/tfrecords/record_*.tfrecord" for e in eukaroytes]
-        # Do second stage on human only.
-        stage_2 = [ "gs://minformer_data/shae_8k/tfrecords/record_*.tfrecord"]
-        iter = data_shae.create_iterator(
-           stage_1=stage_1, stage_2=stage_2, batch_size=args.batch_size, shuffle=True
-        )
-        process_batch = model.process_batch_shae
+    stage_1 = ["gs://minformer_data/shae_8k/tfrecords/record_*.tfrecord"]
+    stage_2 = []
+    # iter = data_shae.create_iterator(
+    #     stage_1=stage_1, stage_2=stage_2, batch_size=args.batch_size, shuffle=True
+    # )
+    iter = data_shae.create_iterator([f"gs://minformer_data/shae_8k/tfrecords/" + "record_*.tfrecord"], [], batch_size=32, shuffle=True)
+    process_batch = model.process_batch_shae
 
     # Model configuration
     cfg = model.Config(
@@ -191,18 +179,13 @@ def main():
         print(f"{field}: {getattr(cfg, field)}")
 
     # Checkpoint manager setup
-    ckpt_manager = model.make_mngr(path=args.checkpoint_dir)
-
+    pretrained_ckpt_manager = model.make_mngr(path=args.pretrained_checkpoint_dir)
+    finetuned_ckpt_manager = model.make_mngr(path=args.finetuned_checkpoint_dir)
     # Initialize or load weights and optimizer state
-    if args.resume_from_checkpoint:
-        print("Resuming from checkpoint...")
-        weights, opt_state = model.load(ckpt_manager, cfg)
-        start_step = ckpt_manager.latest_step()
-    else:
-        print("Initializing new weights...")
-        weights = model.Weights.init(cfg, jax.random.PRNGKey(0), cfg.mesh, model.fsdp_rules)
-        opt_state = model.init_optimizer_state(weights)
-        start_step = 0
+    print(f"Resuming from checkpoint {args.pretrained_checkpoint_dir}")
+    print(f"Saving to checkpoint {args.finetuned_checkpoint_dir}")
+    weights, opt_state = model.load(pretrained_ckpt_manager, cfg)
+    start_step = 0
 
     # JIT-compile the update step
     step = jax.jit(model.update_step, static_argnames=["cfg", "override_compute_loss_fn"])
@@ -261,7 +244,7 @@ def main():
             # Save checkpoint
             if i > 0 and i % args.checkpoint_interval == 0:
                 print(f"Saving checkpoint at step {i}")
-                model.save(ckpt_manager, weights, opt_state, i)
+                model.save(finetuned_ckpt_manager, weights, opt_state, i)
 
     print("Training completed. TensorBoard logs saved in:", log_dir)
 

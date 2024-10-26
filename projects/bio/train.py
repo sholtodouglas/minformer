@@ -4,7 +4,7 @@
 For open genome:
 
 python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=10000 --max_seq_len=16384 --data_dir=gs://minformer_data/open-genome-imgpr/tfrecords/stage1/train_v3/ --log_every=10
-python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run --checkpoint_interval=1000 --max_seq_len=8192 --dataset=shae_8k --log_every=10
+python3 projects/bio/train.py --checkpoint_dir=/tmp/bio_checkpoints/test_run_fp32norm --checkpoint_interval=1000 --max_seq_len=8192 --dataset=shae_8k --log_every=10
 
 """
 
