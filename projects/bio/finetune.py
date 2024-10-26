@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("--log_every", type=int, default=50, help="Log metrics every N steps")
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate model every N steps")
     parser.add_argument("--data_dir", type=str, default="data/tfrecords/", help="Directory containing TFRecord files")
-    parser.add_argument("--log_dir", type=str, default="/tmp/logs/shae", help="Base directory for TensorBoard logs")
+    parser.add_argument("--log_dir", type=str, default="/tmp/logs/finetuning", help="Base directory for TensorBoard logs")
     parser.add_argument(
         "--pretrained_checkpoint_dir", type=str, default="gs://minformer_data/pretrained_ckpt/v1", help="Directory for loading checkpoints"
     )
@@ -238,7 +238,10 @@ def main():
                 writer.add_scalar("loss", loss, i)
                 writer.add_scalar("accuracy", internals["accuracy"], i)
                 writer.add_scalar("num_tokens_per_batch", np.sum(batch["segment_ids"] != 0), i)
-                print(f"Step {i}, Loss: {loss}, Accuracy: {internals['accuracy']}")
+                print(internals['lad_acc'], internals['lad_ce'], internals['lad_mse'])
+                print(batch['aux']['lad_category'][:, 0])
+                print(jnp.argmax(internals['lad_pred'], axis=-1))
+                print(f"Step {i}, Loss: {loss}, Nextoken accuracy (should decrease): {internals['accuracy']}")
                 log_metrics(writer, internals, i)
 
             # Save checkpoint
