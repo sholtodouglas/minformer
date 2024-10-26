@@ -8,7 +8,7 @@ python3 projects/bio/download_data.py --dataset drosophila_genome_8192bp_bins_no
 python3 projects/bio/download_data.py --dataset macaque_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
 python3 projects/bio/download_data.py --dataset mouse_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
 python3 projects/bio/download_data.py --dataset zebrafish_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
-python3 projects/bio/download_data.py --dataset 8kb_genomic_bins_with_sequences_GW17IPC --use-gcs --bucket-name minformer_data --sequence-length=8192
+python3 projects/bio/download_data.py --dataset lab_data --use-gcs --bucket-name minformer_data --sequence-length=8192
 """
 
 import argparse
@@ -23,14 +23,14 @@ import pandas as pd
 from datasets import load_dataset
 from google.cloud import storage
 
-EUKARYOTE = ['drosophila_genome_8192bp_bins_no_N', 'macaque_genome_8192bp_bins_no_N', 'mouse_genome_8192bp_bins_no_N', 'zebrafish_genome_8192bp_bins_no_N', '8kb_genomic_bins_with_sequences_GW17IPC']
+EUKARYOTE = ['drosophila_genome_8192bp_bins_no_N', 'macaque_genome_8192bp_bins_no_N', 'mouse_genome_8192bp_bins_no_N', 'zebrafish_genome_8192bp_bins_no_N']
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download and process DNA data")
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["human-genome-8192", "open-genome-imgpr"] + EUKARYOTE,
+        choices=["human-genome-8192", "open-genome-imgpr", "lab_data"] + EUKARYOTE,
         default="open-genome-imgpr",
         help="Type of dataset to download and process",
     )
@@ -127,7 +127,15 @@ def main():
         df = load_csv_from_gcp_bucket(bucket_name, file_name)
         output_dir = f"gs://{args.bucket_name}/{args.dataset}/tfrecords/"
         data_shae.process_rows(df, output_dir=output_dir, bucket=args.sequence_length)
-
+    elif args.dataset == 'lab_data':
+        bucket_name = "minformer_data"
+        intermediate_progenitor = f"eukaryote_pands/8kb_genomic_bins_with_sequences_GW17IPC.csv"
+        excitatory_neuron = f"eukaryote_pands/8kb_genomic_bins_with_sequences_GW17eN.csv"
+        radial_glia = "eukaryote_pands/8kb_genomic_bins_with_sequences_GW17RG.csv"
+        ip_df_base = load_csv_from_gcp_bucket(bucket_name, intermediate_progenitor)
+        en_df_base = load_csv_from_gcp_bucket(bucket_name, excitatory_neuron)
+        rg_df_base = load_csv_from_gcp_bucket(bucket_name, radial_glia)
+        data_shae.process_dfs(ip_df_base, en_df_base, rg_df_base, args.sequence_length)
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
     print("Packed records created successfully.")

@@ -311,12 +311,12 @@ class Weights:
             ),
             lad_predictor=TensorInfo(
                 jax.ShapeDtypeStruct((embed_dim, 3), cfg.weight_dtype_at_rest),
-                ("d_model", "ffw"),
+                ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
             lad_regressor=TensorInfo(
                 jax.ShapeDtypeStruct((embed_dim, 1), cfg.weight_dtype_at_rest),
-                ("d_model", "ffw"),
+                ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
             sad_hidden=TensorInfo(
@@ -326,12 +326,12 @@ class Weights:
             ),
             sad_predictor=TensorInfo(
                 jax.ShapeDtypeStruct((embed_dim, 3), cfg.weight_dtype_at_rest),
-                ("d_model", "ffw"),
+                ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
             sad_regressor=TensorInfo(
                 jax.ShapeDtypeStruct((embed_dim, 1), cfg.weight_dtype_at_rest),
-                ("d_model", "ffw"),
+                ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
         )
@@ -508,6 +508,8 @@ def attention(
     k_segment_ids: jax.Array,
     q_offset: jax.Array,
     cfg: Config,
+    internals: Any,
+    layer_idx: int,
 ) -> jax.Array:
     """
     Compute attention.
@@ -535,6 +537,7 @@ def attention(
     # Jax softmax impl includes max subtraction for numerical stability, no need to
     # do it outside.
     attn = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
+    internals['layers'][layer_idx]['attn_scores'] = attn
     return jnp.einsum("bhtT,bhTd->bhtd", attn, v).astype(jnp.bfloat16)
 
 
@@ -600,9 +603,10 @@ def forward_layer(
     idx: int,
     cfg: Config,
     cache: KVCache | None = None,
+    internals: Any = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # First RMSNorm (Pre-LN for attention)
-
+    internals['layers'].append({})
     # Cast non-norms to bfloat16 for faster operations.
     layer = dataclasses.replace(layer,
                                 q=cfg.active_weight_dtype(layer.q),
@@ -657,7 +661,7 @@ def forward_layer(
                 raise ValueError("Kernel is only for training.")
             attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
         else:
-            attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg)
+            attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg, internals, idx)
 
     # Project attention output
     with jax.named_scope("projection"):
@@ -720,7 +724,7 @@ def forward(
     aux: Any | None = None,
 ):
 
-    internals = {}
+    internals = {'layers': []}
     # Embed input tokens [B, T] -> [B, T D]
     embeds = weights.embedding[x, :]
     x = embeds
@@ -756,7 +760,7 @@ def forward(
     sin, cos = _generate_pos_embeddings(positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
 
     for idx, layer in enumerate(weights.layers):
-        x, k, v = forward_layer(x, main_block_segment_ids, layer, sin, cos, idx, cfg, cache)
+        x, k, v = forward_layer(x, main_block_segment_ids, layer, sin, cos, idx, cfg, cache, internals)
         if cache is not None:
             cache.k[idx] = k
             cache.v[idx] = v
@@ -796,6 +800,7 @@ def forward(
         last_nonzero = jnp.sum(segment_ids > 0, axis=-1)
         indices = last_nonzero[:, None, None] - 1
         last_xs = jnp.take_along_axis(x, indices, 1)
+        internals['last_embed'] = last_xs
         assert last_xs.shape[1] == 1
         lad = jax.nn.gelu(jnp.einsum("btd,df->btf", last_xs, weights.lad_hidden))
         internals["lad_pred"] = jnp.einsum("btf,fv", lad, weights.lad_predictor)[:, 0, :]  # [B, 3]

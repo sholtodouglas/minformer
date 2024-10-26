@@ -22,6 +22,8 @@ gcsfs = "*"
 jupyter = "^1.1.1"
 ipykernel = "^6.29.5"
 matplotlib = "^3.9.2"
+umap-learn = "^0.5.6"
+seaborn = "^0.13.2"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "*"
