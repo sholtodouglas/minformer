@@ -69,8 +69,6 @@ def load_csv_from_gcp_bucket(bucket_name, file_name):
     # Read the CSV file into a pandas DataFrame
     df = pd.read_csv(data_file)
 
-    print(df.columns)
-
     return df
 
 

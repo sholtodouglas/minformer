@@ -108,9 +108,6 @@ class Config:
     # MEGABYTE only https://openreview.net/pdf?id=JTmO2V9Xpz
     mega_byte: bool = False
     patch_size: int | None = 1
-    # Predict on final step.
-    # Occasionally we'll want to predict some continuous values - like categories.
-    predict_on_final_step: bool = False
     # BERT
     mask_token: int | None = None
 
