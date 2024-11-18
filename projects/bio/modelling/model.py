@@ -110,6 +110,8 @@ class Config:
     patch_size: int | None = 1
     # BERT
     mask_token: int | None = None
+    # SAE
+    return_sae_intermediates: bool = False
 
     @property
     def patch_d(self):
@@ -684,6 +686,9 @@ def forward_layer(
         ff_out = rms_norm(ff_out, layer.ff_out_gamma)
         x = x + ff_out
 
+
+    if cfg.return_sae_intermediates and idx == cfg.num_layers // 2:
+        internals[f'layer_{idx}_activations'] = x
     return x, k, v
 
 
